@@ -4,7 +4,7 @@
 完善 CUDA Programming 10.2.md 文档，添加关于 Group GEMM 的清晰解释，包括概念、数学表述、代码示例和实际应用场景。
 
 ## Current Phase
-Phase 5: group_gemm_pertensor_fp8_kernel 算法总结
+Phase 7: Transposed MMA Tiler 详解
 
 ## Phases
 
@@ -46,17 +46,18 @@ Phase 5: group_gemm_pertensor_fp8_kernel 算法总结
 - **Status:** complete
 
 ### Phase 6: TMA for Group Gemm 详解
-- [ ] 分析 TMA descriptor 的预配置机制
-- [ ] 理解每个 group 独立 TMA descriptor 的设计
-- [ ] 编写 "TMA for Group Gemm" 章节内容
-- **Status:** pending
+- [x] 分析 TMA descriptor 的预配置机制
+- [x] 理解每个 group 独立 TMA descriptor 的设计
+- [x] 编写 "TMA for Group Gemm" 章节内容（已完成，见文档第 208-358 行）
+- **Status:** complete
 
 ### Phase 7: Transposed MMA Tiler 详解
+- [ ] 阅读 kernel 代码中 MMA 配置部分
 - [ ] 分析为什么固定 kTileN=128 而不是 kTileM
 - [ ] 理解转置 MMA 的巧妙用法
 - [ ] 解释对小 M 场景的优化
 - [ ] 编写 "Transposed MMA Tiler" 章节内容
-- **Status:** pending
+- **Status:** in_progress
 
 ### Phase 8: Scheduler for Group Gemm 详解
 - [ ] 分析 Horizontal 模式 (线性扫描)

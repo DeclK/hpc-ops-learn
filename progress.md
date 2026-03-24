@@ -69,18 +69,29 @@
   - `/cyq/Projects/hpc-ops/CUDA Programming 10.2.md` (已更新)
 
 ### Phase 6: TMA for Group Gemm 详解
-- **Status:** pending
+- **Status:** complete
+- **Started:** 2026-03-24
+- **Completed:** 2026-03-24
 - Actions taken:
-  -
+  - 分析 update_grouped_tma kernel 的 block 分工（num_group + 1 个 block）
+  - 解释 kernel 的各个参数含义
+  - 分析 BlockScan 的用法（Exclusive Sum）
+  - 理解为什么只更新 shape/addr 而不更新 stride
+  - 解释 tma_desc_commit_group 和 tma_descriptor_cp_fence_release 的作用
+  - 整理完整 "TMA for Group Gemm" 章节到 CUDA Programming 10.2.md
 - Files created/modified:
-  -
+  - `/cyq/Projects/hpc-ops/CUDA Programming 10.2.md`
 
 ### Phase 7: Transposed MMA Tiler 详解
-- **Status:** pending
+- **Status:** in_progress
+- **Started:** 2026-03-24
 - Actions taken:
-  -
+  - 阅读最新的 CUDA Programming 10.2.md 文档
+  - 更新规划文件状态
+  - 准备阅读 kernel 代码分析 MMA 配置
 - Files created/modified:
-  -
+  - `/cyq/Projects/hpc-ops/task_plan.md`
+  - `/cyq/Projects/hpc-ops/progress.md`
 
 ### Phase 8: Scheduler for Group Gemm 详解
 - **Status:** pending

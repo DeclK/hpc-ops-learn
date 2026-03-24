@@ -207,7 +207,154 @@ __global__ void group_gemm_pertensor_fp8_kernel(...) {
 
 ## TMA for Group Gemm
 
-TODO
+在 hpc-ops 的 Group GEMM 实现中，TMA（Tensor Memory Accelerator）的使用非常巧妙。不同于普通 GEMM 中使用单一 TMA descriptor，这里为每个 group 预配置了独立的 TMA descriptor。这一节我们来详细分析这个设计。
+
+### 为什么需要为每个 group 配置独立的 TMA descriptor？
+
+核心原因就是**每个 group 的数据位置不同**：X 张量在全局内存中是连续存储的 `[total_seq, k]`，第 `igroup` 个 group 的起始位置是 `x_ptr + cu_seqlens[igroup] * k`
+
+如果我们只有一个 tma descriptor，则只能按照这个 tma 的 gmem ptr + copy box offset 的方式进行 copy。对于 group gemm 来说，每个 group 的数据起始位置不可能都正好在 copy box offset 中。因此我们有两个选项：1. 把原始数据 Padding 为 copy box aligned 结构，这样每一个 group 都能和 copy box offset 对齐；2. 给每一个 group 都配置一个独立的 tma descriptor，这样每个 group 的数据都能按照自己的起始位置进行 copy
+
+### Kernel Launch 配置
+
+```cpp
+constexpr int kGroupPerThread = 8;
+constexpr int kThreadPerBlock = 32;
+kernels::update_grouped_tma<...>
+    <<<num_group + 1, kThreadPerBlock, 0, stream>>>(...);
+```
+
+- **Grid/Block 配置**：`num_group + 1` 个 block，每个 block 32 个线程
+- **Block 分工**：
+  - Block `0 ~ num_group-1`：每个 block 处理一个 group，更新该 group 的 X 和 Y 的 TMA descriptor
+  - Block `num_group`：计算所有 group 的 tile 统计信息
+
+### Kernel 参数详解
+
+| 参数 | 类型 | 说明 |
+|------|------|------|
+| `td_xy` | `vec_t<TmaDescriptor, 2>` | **模板 TMA descriptor**，在 Host 端预配置好，包含正确的 stride 等信息 |
+| `tma_xy` | `TmaDescriptor*` | **输出数组**，大小 `num_group * 2`，`tma_xy[igroup*2+0]` 是 X 的 desc，`tma_xy[igroup*2+1]` 是 Y 的 desc |
+| `x_ptr` / `y_ptr` | `const Tin*` / `const Tout*` | X 和 Y 张量的全局指针 |
+| `seqlens_ptr` | `const int*` | 每个 group 的 seqlen，形状 `[num_group]` |
+| `cu_seqlens_ptr` | `const int*` | 累积 seqlen，形状 `[num_group + 1]` |
+| `tiles_ptr` | `int*` | **输出**：每个 group 的 tile 数，形状 `[num_group]` |
+| `cu_tiles_ptr` | `int*` | **输出**：累积 tile 数，形状 `[num_group + 1]` |
+| `num_group` / `m` / `n` / `k` | `int` | 问题维度 |
+
+(补充) BlockScan 的使用
+
+`cub::BlockScan` 是一个并行前缀和计算原语。这里使用的是 **Exclusive Sum Scan**：
+
+Exclusive Scan
+是一种并行计算原语，对数组进行前缀和计算，但每个位置的结果是该位置之前所有元素的和。
+
+```txt
+示例：
+输入:  [a, b, c, d]
+输出:  [0, a, a+b, a+b+c]  ← exclusive sum
+总和:  a+b+c+d               ← block_aggregate
+
+对比 Inclusive Scan：
+输入:  [a, b, c, d]
+输出:  [a, a+b, a+b+c, a+b+c+d]  ← inclusive sum
+```
+
+可以从 hpc-ops 中的代码代表了 block scan 的一般用法
+
+```cpp
+// 第 88 行：定义 BlockScan 类型
+using BlockScan = cub::BlockScan<int, kThreadPerBlock>;
+// - 模板参数 1: int - 扫描的数据类型
+// - 模板参数 2: kThreadPerBlock = 32 - block 中的线程数
+
+// 第 89 行：分配共享内存
+__shared__ typename BlockScan::TempStorage temp_storage;
+// - TempStorage 是 cub 内部定义的结构体
+// - 需要共享内存来协调线程间的通信
+// - 大小由 cub 自动计算
+
+// 第 90 行：用于返回总和
+int block_aggregate;
+
+// 第 91 行：执行 Exclusive Sum Scan
+BlockScan(temp_storage).ExclusiveSum(tiles, tiles, block_aggregate);
+// 参数说明：
+// - tiles (输入): 每个线程贡献的数据数组
+// - tiles (输出): 扫描后的结果（原地修改）
+// - block_aggregate: 返回整个 block 的总和
+```
+
+### TMA Descriptor 更新
+
+当 `blockIdx.x < num_group` 时，为该 group 更新 TMA descriptor。注意，我们**不是在 device 端从头创建 TMA descriptor**，而是：
+1. **Host 端创建模板**：`td_xy` 包含了正确的 stride、tile size 等配置
+2. **Device 端只更新必要字段**：
+   - **全局内存地址**：指向该 group 数据的起始位置
+   - **Shape**：根据该 group 的 seqlen 设置
+
+**为什么 stride 不需要更新？**
+
+| 张量 | Shape | Stride | 是否变化 |
+|------|-------|--------|----------|
+| X | `[num_seq, k]` | `(k, 1)` | **k 固定**，所有 group 一样 |
+| Y | `[n, num_seq]` | `(1, n)` | **n 固定**，所有 group 一样 |
+
+- `k` 是隐藏层维度（hidden_size），对所有 group 相同
+- `n` 是输出维度（output_dim），对所有 group 相同
+- 只有 `num_seq` 变化（`seqlens_ptr[igroup]`）
+
+#### `tma_desc_commit_group` 的作用
+
+```cpp
+if (cute::elect_one_sync()) {
+  cute::tma_desc_commit_group();
+  cute::tma_desc_wait_group();
+}
+```
+
+在我们的代码中，**同一个 warp 中的不同线程在修改不同的 TMA descriptor**：
+- 线程 0 更新 `smem_tma_desc[0]` (X)
+- 线程 1 更新 `smem_tma_desc[1]` (Y)
+
+这时候需要用 `tma_desc_commit_group` 来确保 warp 中所有线程对 TMA descriptor 的修改都完成并且可见。这里的 PTX 和 `tma_store_fence` 是一样的，我们之前使用 `tma_store_fence` 是为了确保 tma store 操作必须要在 smem 写入完成之后。在这里起到同样的作用，因为我们之后要把修改好的 smem 内容写回到 gmem 中存储的 cuTensorMap 当中，必须要保证所有的 smem 写入完成才发起该操作。
+
+#### `tma_descriptor_cp_fence_release` 的作用
+
+这个函数做两件事（fused copy + fence）：
+1. **Copy**：把 128 字节的 TMA descriptor 从 shared memory 拷贝到 global memory
+2. **Fence**：带 `release` 语义的内存屏障。此屏障的作用是：确保之后使用 tma 的操作，都必须在该写入操作完成之后执行。可以想象为，这个 release fence 把之前的所有写代码都拦住了，编译器不可能把他们重排到这个 fence 之后。还有另一种带 `acquire` 语义的内存屏障，它会保证之后的所有读操作都必须在该读操作完成之后执行。这也是为什么 `acquire & release` 通常成对出现，我查阅了下 `tma_store_fence` 它到底属于 acquire 还是 release 呢？我认为答案应该是 both！我们既不能让 smem 写操作跨越该 fence，也不让 tma store 操作跨越该 fence
+
+**与主 kernel 配对使用**：
+
+Producer（update_grouped_tma）:
+```cpp
+tma_descriptor_cp_fence_release(tma_xy + i, smem_tma_desc[i]);
+// "Release": 保证之前的所有写操作都可见
+```
+
+Consumer（主 kernel）:
+```cpp
+tma_descriptor_fence_acquire(td_xy + i);
+// "Acquire": 保证之后的读操作能看到完整的 descriptor
+```
+
+#### `update_tma_gtensor` 的作用 
+
+该 device function 是更新 tma descriptor 的核心。会从 gmem tensor 中提取 shape & stride & gmem ptr，然后把这些信息更新到 TMA descriptor 中。我一开始还有疑问：为什么一定要用 shared memory 创建 cuTensorMap？虽然我之前了解到 tma 存储的信息都是放在 smem 当中的，但是我们仍然可以把这些信息放到寄存器当中，然后修改，最后再存回 gmem 当中呀。后来 agent 了解到 `tma_descriptor_replace_shapes_in_shared_mem` 该 PTX 要求操作源必须在 shared memory 当中，所以必须使用 smem
+
+
+### 总结
+
+| 问题 | 答案 |
+|------|------|
+| 为什么需要 update_grouped_tma？ | 为每个 group 预配置 TMA descriptor，简化主 kernel 逻辑 |
+| Launch 多少个 block？ | `num_group + 1` 个 |
+| 每个 block 做什么？ | 前 num_group 个更新 TMA descriptor，最后一个计算 tile 统计 |
+| 为什么用 BlockScan？ | 高效计算 Exclusive Sum，得到累积 tile 索引 |
+| 为什么只更新 shape/addr？ | stride 对所有 group 都一样，不需要更新 |
+| tma_desc_commit_group 作用？ | 同一个 warp 中多个线程修改 TMA descriptor 时确保一致性 |
+| cp_fence_release 作用？ | Fused copy + release fence，与主 kernel 的 acquire 配对 |
 
 ## Transposed MMA Tiler
 
@@ -217,3 +364,7 @@ TODO
 
 TODO
 
+## Questions
+
+1. hpc-ops 并没有使用 multicast 功能。由于该原因，hpc-ops 在 H100 上的性能就不如 DeepGemm。这在 [issue](https://github.com/Tencent/hpc-ops/issues/28) 当中有提到：For the H100, which has higher compute throughput but lower memory bandwidth, the pipeline places more emphasis on memory access patterns. 这说明在 roofline model 当中，H100 需要更大的 GEMM 计算来达到 compute bound，否则很容易就变得 memory bound。在 Thor 上更是如此，估计其 fp16 算力为 250TFLOPS，而其带宽只有 275GB/s，此使需要计算强度超过 930+ Flops/Byte 才能达到 compute bound。对于端侧来说，几乎大部分的 gemm 都达不到这个计算强度，i.e. 都是 memory bound kernel。而对于 H20 来说，其算力低，带宽大，计算强度拐点 37 Flops/Byte = (148 TFlops / 4000 GB/s) 几乎所有的算子都是 compute bound，所以打不打开 multicast 对性能没那么大影响
+  
