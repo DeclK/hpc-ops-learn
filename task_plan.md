@@ -52,12 +52,12 @@ Phase 7: Transposed MMA Tiler 详解
 - **Status:** complete
 
 ### Phase 7: Transposed MMA Tiler 详解
-- [ ] 阅读 kernel 代码中 MMA 配置部分
-- [ ] 分析为什么固定 kTileN=128 而不是 kTileM
-- [ ] 理解转置 MMA 的巧妙用法
-- [ ] 解释对小 M 场景的优化
-- [ ] 编写 "Transposed MMA Tiler" 章节内容
-- **Status:** in_progress
+- [x] 阅读 kernel 代码中 MMA 配置部分
+- [x] 分析为什么固定 kTileN=128 而不是 kTileM
+- [x] 理解转置 MMA 的巧妙用法
+- [x] 解释对小 M 场景的优化
+- [x] 在 findings.md 中详细整理转置 MMA 的思路
+- **Status:** complete
 
 ### Phase 8: Scheduler for Group Gemm 详解
 - [ ] 分析 Horizontal 模式 (线性扫描)

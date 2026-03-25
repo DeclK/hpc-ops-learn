@@ -302,144 +302,261 @@ else {
 - 硬件利用率低（小矩阵无法填满 Tensor Core）
 - 需要大量 padding，浪费计算和内存
 
-### hpc-ops 的解决方案：转置 MMA
+---
 
-关键洞察：**既然 Tensor Core 在 N 维度粒度较小，那我们把整个问题转置过来！**
+### 核心概念：为什么转置是必要的？
 
-#### 1. MMA 指令选择
+#### 标准 MMA Atom 的约定
 
-从 `config.h` 第 42-61 行可以看到：
+首先理解 CuTe/CUTLASS 中 MMA atom 的标准约定：
 
-```cpp
-template <int kTileM>
-static constexpr auto mma_selector() {
-  if constexpr (kTileM == 16) {
-    return cute::SM90_64x16x32_F32E4M3E4M3_SS_TN<>{};
-  } else if constexpr (kTileM == 32) {
-    return cute::SM90_64x32x32_F32E4M3E4M3_SS_TN<>{};
-  }
-  // ...
-}
+```
+标准 MMA: C = A @ B
+  - A.shape = (M, K)   ← 通常是 Input X
+  - B.shape = (N, K)   ← 通常是 Weight W
+  - C.shape = (M, N)   ← 输出 Y
 ```
 
-注意命名中的 `_TN` 后缀：
-- `T` = Transposed（转置）
-- `N` = Normal（正常）
+但 SM90 架构的 MMA 指令有一个特点：**M 维度的粒度通常较大（64/128），而 N 维度的粒度可以更小（16/32）**。
 
-这表示：**A 矩阵转置，B 矩阵正常**
-
-#### 2. 数据路径转置
-
-在 `kernels.cuh` 第 313-317 行，关键的 partition 操作：
-
+看 `config.h` 中的指令选择：
 ```cpp
-auto tBs4r = thr_mma.partition_A(sB);  // sB (W矩阵) 作为 MMA 的 A
-auto tAs4r = thr_mma.partition_B(sA);  // sA (X矩阵) 作为 MMA 的 B
-
-auto tBr = thr_mma.make_fragment_A(tBs4r);  // (MMA, MMA_N, MMA_K, kStage)
-auto tAr = thr_mma.make_fragment_B(tAs4r);  // (MMA, MMA_M, MMA_K, kStage)
+SM90_64x16x32_F32E4M3E4M3_SS_TN  // M=64, N=16
+SM90_64x32x32_F32E4M3E4M3_SS_TN  // M=64, N=32
+SM90_64x64x32_F32E4M3E4M3_SS_TN  // M=64, N=64
 ```
 
-**普通 GEMM vs hpc-ops Group GEMM 对比**：
+注意：**M 固定是 64，而 N 可以是 16/32/64！**
 
-| 角色 | 普通 GEMM | hpc-ops Group GEMM |
+#### Group GEMM 的痛点
+
+在 Group GEMM 中：
+- **M 维度** = seqlen（每个 group 的 token 数），可能很小（如 4, 8, 16）
+- **N 维度** = output_dim（输出维度），通常很大（如 7168, 14336）
+
+如果用标准 MMA：
+- kTileM 最小是 64，对于 seqlen=16 来说太大了
+- 大量 padding 浪费计算和内存
+
+**解决方案：把问题转置过来！**
+
+---
+
+### hpc-ops 的转置设计详解
+
+#### 1. 整体思路
+
+```
+原始问题: Y[M, N] = X[M, K] @ W^T[K, N]
+
+转置后:   Y^T[N, M] = W[N, K] @ X^T[K, M]
+           ↑              ↑           ↑
+         输出          Weight      Input
+         (现在 N 维度大了！)
+```
+
+通过转置，原来的小 M 变成了小 N，而原来的大 N 变成了大 M！
+
+#### 2. 关键代码点：A 和 B 的互换
+
+在 `kernels.cuh` 第 313-317 行：
+
+```cpp
+// sA 是 X [M, K], sB 是 W [N, K]
+
+auto tBs4r = thr_mma.partition_A(sB);  // ← sB (W) 作为 MMA 的 A
+auto tAs4r = thr_mma.partition_B(sA);  // ← sA (X) 作为 MMA 的 B
+
+auto tBr = thr_mma.make_fragment_A(tBs4r);  // fragment A ← W
+auto tAr = thr_mma.make_fragment_B(tAs4r);  // fragment B ← X
+```
+
+**这是最关键的一步！** 角色完全互换了：
+
+| 角色 | 标准 GEMM | hpc-ops Group GEMM |
 |------|-----------|-------------------|
-| MMA A 矩阵 | X [M, K] | W [N, K] |
-| MMA B 矩阵 | W [N, K] | X [M, K] |
-| 结果 C | Y [M, N] | Y^T [N, M] |
+| MMA A 矩阵 | X [M, K] | **W [N, K]** ← 互换 |
+| MMA B 矩阵 | W [N, K] | **X [M, K]** ← 互换 |
+| 结果 C | Y [M, N] | **Y^T [N, M]** ← 转置 |
 
-#### 3. 共享内存布局转置
+#### 3. MMA 指令的 _TN 后缀
 
-从 `config.h` 第 81-86 行：
+看 `config.h` 第 42-61 行的指令命名：
+
+```cpp
+SM90_64x16x32_F32E4M3E4M3_SS_TN
+                           ↑↑
+                           TN
+```
+
+`_TN` 后缀的含义：
+- **T** = Transposed → A 矩阵在 MMA 内部是转置的
+- **N** = Normal → B 矩阵在 MMA 内部是正常的
+
+结合我们的使用方式：
+- A = W [N, K]，经过 T 转置后，MMA 看到的是 [K, N]
+- B = X [M, K]，经过 N 正常，MMA 看到的是 [M, K]
+- **等等，这里需要更仔细的理解...**
+
+实际上，更准确的理解是：**我们选择 _TN 指令是为了配合数据在 shared memory 中的布局。**
+
+#### 4. 共享内存布局也转置了
+
+看 `config.h` 第 81-86 行：
 
 ```cpp
 using SLayoutX = decltype(tile_to_shape(SLayoutXAtom{},
-                                        make_shape(Int<kTileM>{}, Int<kTileK>{}, Int<kStage>{})));
+                                        make_shape(Int<kTileM>{}, Int<kTileK>{})));
 using SLayoutW = decltype(tile_to_shape(SLayoutWAtom{},
-                                        make_shape(Int<kTileN>{}, Int<kTileK>{}, Int<kStage>{})));
+                                        make_shape(Int<kTileN>{}, Int<kTileK>{})));
 using SLayoutY =
     decltype(tile_to_shape(SLayoutYAtom{}, make_shape(Int<kTileN>{}, Int<kTileM>{})));
 ```
 
-注意 `SLayoutY` 是 `[kTileN, kTileM]` 而不是 `[kTileM, kTileN]`！
+注意：
+- SLayoutX (X矩阵): `[kTileM, kTileK]` ✓ 正常
+- SLayoutW (W矩阵): `[kTileN, kTileK]` ✓ 正常
+- **SLayoutY (输出): `[kTileN, kTileM]` ← 转置了！**
 
-#### 4. GMMA 调用
+输出 shared memory 是 `[N, M]` 而不是 `[M, N]`！
+
+#### 5. GMMA 调用
 
 在 `kernels.cuh` 第 360 行：
 
 ```cpp
 cute::gemm(tiled_mma, tBr(_, _, ik, ismem_read), tAr(_, _, ik, ismem_read), tCr(_, _, _));
+//                    ↑                          ↑                          ↑
+//                  fragment A               fragment B               fragment C
+//                  (W数据)                   (X数据)                   (Y^T)
 ```
 
-这里计算的是：`C = A * B`，但由于转置的原因，实际效果等价于：
+#### 6. Epilogue: 存储时也要考虑转置
 
-```
-原始问题: Y = X * W^T
-转置后:   Y^T = W * X^T
-```
-
-#### 5. Epilogue 存储转置
-
-在 `kernels.cuh` 第 411-419 行，输出时也需要转置回来：
+在 `kernels.cuh` 第 411-419 行：
 
 ```cpp
-auto gD = tma_d.get_tma_tensor(make_shape(n, m));  // Y 的形状是 [n, m]
+// gD 的形状是 [n, m]，不是 [m, n]！
+auto gD = tma_d.get_tma_tensor(make_shape(n, m));
+
 // ...
+
+// 注意索引顺序: itile_n 在前，itile_m 在后
 cute::copy(tma_d.with(td_y), tDs(_, iwarpgroup, Int<0>{}),
            tDg(_, itile_n * 2 + iwarpgroup, itile_m));
 ```
 
-### 为什么这样做是巧妙的？
+---
 
-#### 优点 1：M 维度粒度更细
+### 完整数据流总结
 
-| 配置 | kTileM | kTileN |
-|------|--------|--------|
-| 普通 MMA | 128 | 16/32/64 |
-| 转置 MMA | 16/32/48/64 | 128 |
+让我们用一个具体例子来说明：
 
-通过转置，M 维度的 tile 大小可以灵活选择（16/32/48/64），适应不同的 seqlen。
+假设：
+- seqlen (M) = 16
+- output_dim (N) = 128
+- hidden_size (K) = 128
 
-#### 优点 2：根据平均 seqlen 自适应选择
+**标准 MMA 的问题：**
+```
+kTileM = 64 (最小)，但我们只有 M=16
+→ 需要 padding 到 64，浪费 75% 的计算
+```
 
-在文档第 107-114 行提到的策略：
+**hpc-ops 转置方案：**
 
-| avg_seqlen | kTileM | kTileN | kTileK | kStage |
-|------------|--------|--------|--------|--------|
-| ≤16        | 16     | 128    | 128    | 8      |
-| ≤32        | 32     | 128    | 128    | 8      |
-| ≤48        | 48     | 128    | 128    | 8      |
-| >48        | 64     | 128    | 128    | 8      |
+| 阶段 | 操作 | 形状 | 说明 |
+|------|------|------|------|
+| 输入 | X | [16, 128] | seqlen=16 |
+| 输入 | W | [128, 128] | output_dim=128 |
+| TMA 加载 | sA = X_tile | [16, 128] | kTileM=16 ✓ |
+| TMA 加载 | sB = W_tile | [128, 128] | kTileN=128 |
+| **关键** | MMA A = sB | [128, 128] | W 作为 A |
+| **关键** | MMA B = sA | [16, 128] | X 作为 B |
+| GMMA | C = A @ B | [128, 16] | Y^T！ |
+| Epilogue | 存储 Y^T | [128, 16] | 全局内存 |
+| 最终结果 | Y = (Y^T)^T | [16, 128] | 逻辑上正确 |
 
-对于小 seqlen（如 ≤16），使用 kTileM=16，避免浪费；对于大 seqlen，使用 kTileM=64，提高效率。
+---
 
-#### 优点 3：N 维度固定为 128，充分利用 Tensor Core
+### 为什么固定 kTileN=128 而不是 kTileM？
 
-N 维度是输出维度（output_dim），通常较大（如 7168、14336），固定 kTileN=128 可以：
-- 充分填满 Tensor Core
-- 保持计算效率
-- 简化调度逻辑
+这是一个非常好的问题。答案在于：**N 维度通常很大，而 M 维度可能很小。**
 
-### 数学验证
+看 `group_gemm_pertensor_fp8.cu` 中的配置：
 
-让我们验证转置的正确性：
+```cpp
+// kTileN 固定是 128！
+constexpr static int kTileN = 128;
+constexpr static int kTileK = 128;
+
+// kTileM 根据平均 seqlen 自适应选择
+if (num_seq_per_group_avg <= 16) {
+  run_with_config<16, 128, 128, 8>(...);
+} else if (num_seq_per_group_avg <= 32) {
+  run_with_config<32, 128, 128, 8>(...);
+} else if (num_seq_per_group_avg <= 48) {
+  run_with_config<48, 128, 128, 8>(...);
+} else {
+  run_with_config<64, 128, 128, 8>(...);
+}
+```
+
+**策略的合理性：**
+
+| 维度 | 特点 | tile 大小策略 |
+|------|------|-------------|
+| **M** (seqlen) | 可能很小 (4, 8, 16, ...) | **自适应** (16/32/48/64) |
+| **N** (output_dim) | 通常很大 (7168, 14336) | **固定 128**，充分利用硬件 |
+| **K** (hidden_size) | 通常是 128 的倍数 | **固定 128** |
+
+---
+
+### 数学正确性验证
+
+让我们严谨地证明转置的正确性：
 
 ```
 原始问题:
-Y[M, N] = X[M, K] * W^T[K, N]
+  Y[M, N] = X[M, K] * W^T[K, N]
 
-转置后计算:
-Y^T[N, M] = W[N, K] * X^T[K, M]
+转置等式两边:
+  Y^T[N, M] = (X * W^T)^T
+             = (W^T)^T * X^T           (矩阵转置性质: (AB)^T = B^T A^T)
+             = W[N, K] * X^T[K, M]     ✓
 
-两边转置:
-Y[M, N] = (Y^T)^T[M, N] = (W * X^T)^T = X * W^T ✓
+hpc-ops 实际计算的就是:
+  C[N, M] = A[N, K] * B[M, K]^T       (A=W, B=X)
+           = W[N, K] * X^T[K, M]
+           = Y^T[N, M]
+
+最后在逻辑上, 用户拿到的 Y 就是正确的结果!
 ```
+
+---
+
+### 需要注意的代码点总结
+
+当阅读 hpc-ops 代码时，如果看到 "奇怪" 的索引顺序，不要困惑，这都是转置设计的一部分：
+
+| 文件 | 行号 | 代码 | 注意事项 |
+|------|------|------|---------|
+| `config.h` | 42-61 | `mma_selector()` | 都是 `_TN` 指令 |
+| `config.h` | 85-86 | `SLayoutY` | 形状是 `[kTileN, kTileM]` |
+| `kernels.cuh` | 313-314 | `partition_A(sB)` / `partition_B(sA)` | **A 和 B 互换** |
+| `kernels.cuh` | 360 | `gemm(tiled_mma, tBr, tAr, tCr)` | **tBr 在前，tAr 在后** |
+| `kernels.cuh` | 411 | `make_shape(n, m)` | **n 在前，m 在后** |
+| `kernels.cuh` | 418-419 | `tDg(_, itile_n * 2 + iwarpgroup, itile_m)` | **itile_n 在前** |
+
+---
 
 ### 总结
 
-Transposed MMA Tiler 的核心思想是：**利用 Tensor Core 在 N 维度粒度较小的特点，通过转置整个问题，让 M 维度的 tile 大小可以灵活配置，从而适应小 seqlen 场景。**
+Transposed MMA Tiler 的核心思想可以用一句话概括：
 
-这个设计展示了如何通过改变问题的表述方式（而不是改变硬件）来获得更好的性能。
+> **既然 Tensor Core 在 N 维度粒度较小，那我们就通过转置，把小的 seqlen (M) 放到 N 维度，把大的 output_dim (N) 放到 M 维度！**
+
+这个设计展示了如何通过**改变问题的表述方式**（而不是改变硬件）来获得更好的性能。这是一个非常巧妙的工程权衡！
 
 ---
 
