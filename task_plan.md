@@ -4,7 +4,7 @@
 完善 CUDA Programming 10.2.md 文档，添加关于 Group GEMM 的清晰解释，包括概念、数学表述、代码示例和实际应用场景。
 
 ## Current Phase
-Phase 7: Transposed MMA Tiler 详解
+Phase 8: Scheduler for Group Gemm 详解
 
 ## Phases
 
@@ -57,6 +57,7 @@ Phase 7: Transposed MMA Tiler 详解
 - [x] 理解转置 MMA 的巧妙用法
 - [x] 解释对小 M 场景的优化
 - [x] 在 findings.md 中详细整理转置 MMA 的思路
+- [x] **用户更新文档**: 添加了 STSM 转置操作、内存布局连续性的解释
 - **Status:** complete
 
 ### Phase 8: Scheduler for Group Gemm 详解
@@ -64,6 +65,13 @@ Phase 7: Transposed MMA Tiler 详解
 - [ ] 分析 Vertical 模式 (二分查找)
 - [ ] 理解两种模式的适用场景
 - [ ] 编写 "Scheduler for Group Gemm" 章节内容
+- **Status:** pending
+
+### Phase 9: Scale for DeQuantization 详解
+- [ ] 理解 Pertensor 情况下的反量化缩放
+- [ ] 分析 Blockwise 情况下的 scale 查找复杂度
+- [ ] 理解需要的 layout algebra
+- [ ] 编写 "Scale for DeQuantization" 章节内容
 - **Status:** pending
 
 ## Key Questions

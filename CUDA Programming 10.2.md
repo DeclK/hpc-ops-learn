@@ -356,7 +356,7 @@ tma_descriptor_fence_acquire(td_xy + i);
 | tma_desc_commit_group 作用？ | 同一个 warp 中多个线程修改 TMA descriptor 时确保一致性 |
 | cp_fence_release 作用？ | Fused copy + release fence，与主 kernel 的 acquire 配对 |
 
-## Transposed MMA Tiler
+## Transposed MMA
 
 ### 问题背景
 
@@ -367,8 +367,6 @@ tma_descriptor_fence_acquire(td_xy + i);
 ---
 
 ### 核心概念：为什么转置是必要的？
-
-#### 标准 MMA Atom 的约定
 
 首先理解 CuTe/CUTLASS 中 MMA atom 的标准约定：
 
@@ -388,11 +386,8 @@ SM90_64x32x32_F32E4M3E4M3_SS_TN  // M=64, N=32
 SM90_64x64x32_F32E4M3E4M3_SS_TN  // M=64, N=64
 ```
 
-注意：**M 固定是 64，而 N 可以是 16/32/64！**
+注意：**M 固定是 64，而 N 可以是 16/32/64！**在 Group GEMM 中：
 
-#### Group GEMM 的痛点
-
-在 Group GEMM 中：
 - **M 维度** = seqlen（每个 group 的 token 数），可能很小（如 4, 8, 16）
 - **N 维度** = output_dim（输出维度），通常很大（如 7168, 14336）
 
@@ -400,28 +395,25 @@ SM90_64x64x32_F32E4M3E4M3_SS_TN  // M=64, N=64
 - kTileM 最小是 64，对于 seqlen=16 来说太大了
 - 大量 padding 浪费计算和内存
 
-**解决方案：把问题转置过来！**
+**所以，hpc-ops 采取了一个巧妙的解决方案：把问题转置过来！**
 
 ---
 
-### hpc-ops 的转置设计详解
-
-#### 1. 整体思路
+### hpc-ops transposed MMA
 
 ```
-原始问题: Y[M, N] = X[M, K] @ W^T[K, N]
+Gemm  :  C[M, N] = A[M, K] @ B[K, N]
 
-转置后:   Y^T[N, M] = W[N, K] @ X^T[K, M]
+原始问题: Y[M, N] = X[M, K] @ W^T[N, K]
+
+转置后:   Y[N, M] = W[N, K] @ X^T[M, K]
            ↑              ↑           ↑
          输出          Weight      Input
-         (现在 N 维度大了！)
 ```
 
-通过转置，原来的小 M 变成了小 N，而原来的大 N 变成了大 M！
+GEMM 算法只要求你传入 A, B 两个矩阵的数据，并不会要求你的 A 矩阵一定是输入 X，B 矩阵一定是权重 W。所以 hpc-ops 把问题转置过来，A 矩阵传入的其实是权重数据，而 B 矩阵传入输入 X 数据。这样 MMA atom 在 M 维度粒度就能够变小了，对于小 seqlen or deocde 的场景非常有用
 
-#### 2. 关键代码点：A 和 B 的互换
-
-在 `kernels.cuh` 第 313-317 行：
+具体代码在 `kernels.cuh` 第 313-317 行：
 
 ```cpp
 // sA 是 X [M, K], sB 是 W [N, K]
@@ -431,193 +423,46 @@ auto tAs4r = thr_mma.partition_B(sA);  // ← sA (X) 作为 MMA 的 B
 
 auto tBr = thr_mma.make_fragment_A(tBs4r);  // fragment A ← W
 auto tAr = thr_mma.make_fragment_B(tAs4r);  // fragment B ← X
-```
 
-**这是最关键的一步！** 角色完全互换了：
-
-| 角色 | 标准 GEMM | hpc-ops Group GEMM |
-|------|-----------|-------------------|
-| MMA A 矩阵 | X [M, K] | **W [N, K]** ← 互换 |
-| MMA B 矩阵 | W [N, K] | **X [M, K]** ← 互换 |
-| 结果 C | Y [M, N] | **Y^T [N, M]** ← 转置 |
-
-#### 3. MMA 指令的 _TN 后缀
-
-看 `config.h` 第 42-61 行的指令命名：
-
-```cpp
-SM90_64x16x32_F32E4M3E4M3_SS_TN
-                           ↑↑
-                           TN
-```
-
-`_TN` 后缀的含义：
-- **T** = Transposed → A 矩阵在 MMA 内部是转置的
-- **N** = Normal → B 矩阵在 MMA 内部是正常的
-
-实际上，更准确的理解是：**我们选择 _TN 指令是为了配合数据在 shared memory 中的布局。**
-
-#### 4. 共享内存布局也转置了
-
-看 `config.h` 第 81-86 行：
-
-```cpp
-using SLayoutX = decltype(tile_to_shape(SLayoutXAtom{},
-                                        make_shape(Int<kTileM>{}, Int<kTileK>{})));
-using SLayoutW = decltype(tile_to_shape(SLayoutWAtom{},
-                                        make_shape(Int<kTileN>{}, Int<kTileK>{})));
-using SLayoutY =
-    decltype(tile_to_shape(SLayoutYAtom{}, make_shape(Int<kTileN>{}, Int<kTileM>{})));
-```
-
-注意：
-- SLayoutX (X矩阵): `[kTileM, kTileK]` ✓ 正常
-- SLayoutW (W矩阵): `[kTileN, kTileK]` ✓ 正常
-- **SLayoutY (输出): `[kTileN, kTileM]` ← 转置了！**
-
-输出 shared memory 是 `[N, M]` 而不是 `[M, N]`！
-
-#### 5. GMMA 调用
-
-在 `kernels.cuh` 第 360 行：
-
-```cpp
+// call gemm kernel
 cute::gemm(tiled_mma, tBr(_, _, ik, ismem_read), tAr(_, _, ik, ismem_read), tCr(_, _, _));
 //                    ↑                          ↑                          ↑
 //                  fragment A               fragment B               fragment C
 //                  (W数据)                   (X数据)                   (Y^T)
 ```
 
-#### 6. Epilogue: 存储时也要考虑转置
-
-在 `kernels.cuh` 第 411-419 行：
+不过此时，数据矩阵 Y 的 Layout 会发生改变
+```txt
+原始问题：Y[M, N], Y is layout right: (M, N):(N, 1)
+转置问题：Y[N, M], Y is layout right: (N, M):(M, 1)
+```
+此时两个 Y 的内存排布就完全不一样了，前者可以认为是 shape `(M, N)` 的 row major layout，而后者 `(N, M):(M, 1)` 可以认为是 column major layout `(M, N):(1, M)`，只需要我们把维度排布一下即可，元素在内存上的排布式完全一致的。但是我们的仍然希望我们的输出仍然是 row major 的，这就需要在 stsm (store shared memory, r2s copy) 的时候进行转置操作。所以我们可以看到 hpc-ops 使用了 `cute::SM90_U16x8_STSM_T` 作为 copy atom，这样就能在 copy 时顺便完成该转置操作。所以我们能够看到在 `config.h` 中使用了 N 维度连续的 smem layout：
 
 ```cpp
-// gD 的形状是 [n, m]，不是 [m, n]！
-auto gD = tma_d.get_tma_tensor(make_shape(n, m));
+// SMEM ATom is in MN major, which means continuous in N dimension
+using SLayoutYAtom = decltype(slayout_selector<kSwizzleY, Tout, false>());
+using SLayoutY = decltype(tile_to_shape(SLayoutYAtom{}, make_shape(Int<kTileN>{}, Int<kTileM>{})));
+```
 
-// ...
+注意：如果我们不选择 trans atom，那么这样的操作是不合法的。因为 `cute::SM90_U16x8_STSM_N` copy 完成过后，smem 的 layout 就会是 `(N, M):(M, 1)`，其将会在 M 方向上进行连续的写入，而我们定义的 smem atom 为 `(N, M):(1, N)`， 其在 M 方向上是不连续的，违反 copy 的连续性要求
 
-// 注意索引顺序: itile_n 在前，itile_m 在后
+另外在 epilogue 当中 hpc-ops 选择了每一个 warpgroup 各自读取一半的数据，然后再进行 store。我一开始以为是 tma copy box 大小本身的约束，实际上并不是，虽然 tma copy box 确实有大小约束，根据 [写给大家看的 CuTe 教程：TMA Copy](https://zhuanlan.zhihu.com/p/2003198909405763007) 中的描述，单个维度的元素数量最大为 256，跟据 [cute 之 Hopper TMA](https://zhuanlan.zhihu.com/p/1985678344352731952) 最小的 copy 单元为 16 bytes。我之前的做法是需要两个 warpgroup 进行同步，等 rmem -> smem 完成写入过后用单个 thread 发起，这样同步的消耗显然会大于单个 warpgroup 级别的同步。此时无论哪一个 warpgroup 完成 smem -> rmem 的读取过后，都可以直接发起 store，这样可以减少同步的开销
+
+```cpp
+syncwarpgroup(iwarpgroup);
+cute::tma_store_fence();
+// code ...
 cute::copy(tma_d.with(td_y), tDs(_, iwarpgroup, Int<0>{}),
            tDg(_, itile_n * 2 + iwarpgroup, itile_m));
 ```
 
----
-
-### 完整数据流总结
-
-让我们用一个具体例子来说明：
-
-假设：
-- seqlen (M) = 16
-- output_dim (N) = 128
-- hidden_size (K) = 128
-
-**标准 MMA 的问题：**
-```
-kTileM = 64 (最小)，但我们只有 M=16
-→ 需要 padding 到 64，浪费 75% 的计算
-```
-
-**hpc-ops 转置方案：**
-
-| 阶段 | 操作 | 形状 | 说明 |
-|------|------|------|------|
-| 输入 | X | [16, 128] | seqlen=16 |
-| 输入 | W | [128, 128] | output_dim=128 |
-| TMA 加载 | sA = X_tile | [16, 128] | kTileM=16 ✓ |
-| TMA 加载 | sB = W_tile | [128, 128] | kTileN=128 |
-| **关键** | MMA A = sB | [128, 128] | W 作为 A |
-| **关键** | MMA B = sA | [16, 128] | X 作为 B |
-| GMMA | C = A @ B | [128, 16] | Y^T！ |
-| Epilogue | 存储 Y^T | [128, 16] | 全局内存 |
-| 最终结果 | Y = (Y^T)^T | [16, 128] | 逻辑上正确 |
-
----
-
-### 为什么固定 kTileN=128 而不是 kTileM？
-
-这是一个非常好的问题。答案在于：**N 维度通常很大，而 M 维度可能很小。**
-
-看 `group_gemm_pertensor_fp8.cu` 中的配置：
-
-```cpp
-// kTileN 固定是 128！
-constexpr static int kTileN = 128;
-constexpr static int kTileK = 128;
-
-// kTileM 根据平均 seqlen 自适应选择
-if (num_seq_per_group_avg <= 16) {
-  run_with_config<16, 128, 128, 8>(...);
-} else if (num_seq_per_group_avg <= 32) {
-  run_with_config<32, 128, 128, 8>(...);
-} else if (num_seq_per_group_avg <= 48) {
-  run_with_config<48, 128, 128, 8>(...);
-} else {
-  run_with_config<64, 128, 128, 8>(...);
-}
-```
-
-**策略的合理性：**
-
-| 维度 | 特点 | tile 大小策略 |
-|------|------|-------------|
-| **M** (seqlen) | 可能很小 (4, 8, 16, ...) | **自适应** (16/32/48/64) |
-| **N** (output_dim) | 通常很大 (7168, 14336) | **固定 128**，充分利用硬件 |
-| **K** (hidden_size) | 通常是 128 的倍数 | **固定 128** |
-
----
-
-### 数学正确性验证
-
-让我们严谨地证明转置的正确性：
-
-```
-原始问题:
-  Y[M, N] = X[M, K] * W^T[K, N]
-
-转置等式两边:
-  Y^T[N, M] = (X * W^T)^T
-             = (W^T)^T * X^T           (矩阵转置性质: (AB)^T = B^T A^T)
-             = W[N, K] * X^T[K, M]     ✓
-
-hpc-ops 实际计算的就是:
-  C[N, M] = A[N, K] * B[M, K]^T       (A=W, B=X)
-           = W[N, K] * X^T[K, M]
-           = Y^T[N, M]
-
-最后在逻辑上, 用户拿到的 Y 就是正确的结果!
-```
-
----
-
-### 需要注意的代码点总结
-
-当阅读 hpc-ops 代码时，如果看到 "奇怪" 的索引顺序，不要困惑，这都是转置设计的一部分：
-
-| 文件 | 行号 | 代码 | 注意事项 |
-|------|------|------|---------|
-| `config.h` | 42-61 | `mma_selector()` | 都是 `_TN` 指令 |
-| `config.h` | 85-86 | `SLayoutY` | 形状是 `[kTileN, kTileM]` |
-| `kernels.cuh` | 313-314 | `partition_A(sB)` / `partition_B(sA)` | **A 和 B 互换** |
-| `kernels.cuh` | 360 | `gemm(tiled_mma, tBr, tAr, tCr)` | **tBr 在前，tAr 在后** |
-| `kernels.cuh` | 411 | `make_shape(n, m)` | **n 在前，m 在后** |
-| `kernels.cuh` | 418-419 | `tDg(_, itile_n * 2 + iwarpgroup, itile_m)` | **itile_n 在前** |
-
----
-
-### 总结
-
-Transposed MMA Tiler 的核心思想可以用一句话概括：
-
-> **既然 Tensor Core 在 N 维度粒度较小，那我们就通过转置，把小的 seqlen (M) 放到 N 维度，把大的 output_dim (N) 放到 M 维度！**
-
-这个设计展示了如何通过**改变问题的表述方式**（而不是改变硬件）来获得更好的性能。这是一个非常巧妙的工程权衡！
-
 ## Scheduler for Group Gemm
 
 TODO
+
+## Scale for DeQuantization
+
+TODO, 我们在完成 mainloop 过后，需要把 register 当中的 fp32 结果乘以 scale 以进行反量化。在 Pertensor 情况下，这很简单，这部分在 blockwise 的情况下会稍微复杂一点，因为每一个线程所保留的数据需要找到对应的 scale，这需要一些 layout algebra
 
 ## Questions
 

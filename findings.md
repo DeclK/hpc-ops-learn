@@ -687,5 +687,48 @@ Scheduler 的设计体现了**实用主义**：
 - 通过编译期条件（`if constexpr`）选择实现，无运行时开销
 
 ---
+
+## 关于两个 warpgroup 做 TMA store 的澄清
+
+### 之前的误解
+我之前认为使用两个 warpgroup 做 TMA store 是因为 **TMA copy box 硬件限制**。
+
+### 用户的澄清（准确答案）
+
+真正的原因是**减少同步开销**！
+
+#### 分析
+
+**方案对比：**
+
+| 方案 | 描述 | 缺点 |
+|------|------|------|
+| 单 thread 发起 | 两个 warpgroup 同步，等 rmem→smem 完成后，单个 thread 发起 TMA store | 同步开销大 |
+| **两个 warpgroup 各自发起**（hpc-ops 方案）| 每个 warpgroup 完成 rmem→smem 读取后，直接发起 store | 同步开销小 |
+
+#### 代码证据
+
+```cpp
+// kernels.cuh 第 403-404, 408, 418-419 行
+syncwarpgroup(iwarpgroup);              // ← 只需要 warpgroup 级别同步
+cute::tma_store_fence();
+// ...
+cute::copy(tma_d.with(td_y), tDs(_, iwarpgroup, Int<0>{}),
+           tDg(_, itile_n * 2 + iwarpgroup, itile_m));
+```
+
+#### TMA copy box 的实际限制（参考知乎文章）
+
+根据用户提供的参考资料：
+- **单个维度的元素数量最大为 256**（对于 kTileN=128 来说完全够用）
+- **最小的 copy 单元为 16 bytes**
+
+这些限制都不是 hpc-ops 使用两个 warpgroup 的原因。
+
+#### 用户的参考链接
+1. [写给大家看的 CuTe 教程：TMA Copy](https://zhuanlan.zhihu.com/p/2003198909405763007)
+2. [cute 之 Hopper TMA](https://zhuanlan.zhihu.com/p/1985678344352731952)
+
+---
 *Update this file after every 2 view/browser/search operations*
 *This prevents visual information from being lost*

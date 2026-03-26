@@ -94,16 +94,39 @@
   - 整理完整的转置 MMA 数据流
   - 总结需要注意的代码点（索引顺序、形状等）
   - 更新 findings.md，添加详细的转置 MMA 详解
+  - **用户更新**: 添加了 STSM 转置操作、内存布局连续性的解释
 - Files created/modified:
   - `/cyq/Projects/hpc-ops/task_plan.md`
   - `/cyq/Projects/hpc-ops/progress.md`
   - `/cyq/Projects/hpc-ops/findings.md` (已详细更新)
+  - `/cyq/Projects/hpc-ops/CUDA Programming 10.2.md` (用户更新)
 
 ### Phase 8: Scheduler for Group Gemm 详解
 - **Status:** pending
-- Actions taken:
+- **Actions taken:**
   -
 - Files created/modified:
+  -
+
+### Phase 9: Scale for DeQuantization 详解
+- **Status:** pending
+- **Actions taken:**
+  -
+- Files created/modified:
+  -
+
+## Session: 2026-03-26
+
+### 用户文档更新
+- **Status:** in_progress
+- **Actions taken:**
+  - 用户完成 "TMA for Group Gemm" 章节，添加了 tma_desc_commit_group、cp_fence_release、update_tma_gtensor 的详细解释
+  - 用户完成 "Transposed MMA" 章节，添加了 STSM 转置操作、内存布局连续性的重要补充
+  - **用户更新**: 添加了关于两个 warpgroup 做 TMA store 的详细解释，澄清是为了减少同步开销，而非单纯硬件限制
+  - **用户新增**: 两个知乎参考链接（CuTe 教程、Hopper TMA）
+  - 用户新增 "Questions" 章节，讨论 H100 vs H20 的 multicast 问题和 roofline model 分析
+  - **用户新增**: "Scale for DeQuantization" 章节（TODO）
+  - "Scheduler for Group Gemm" 仍为 TODO
 
 ## Test Results
 | Test | Input | Expected | Actual | Status |
