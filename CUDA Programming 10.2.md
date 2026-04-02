@@ -238,9 +238,11 @@ kernels::update_grouped_tma<...>
 | `x_ptr` / `y_ptr` | `const Tin*` / `const Tout*` | X 和 Y 张量的全局指针 |
 | `seqlens_ptr` | `const int*` | 每个 group 的 seqlen，形状 `[num_group]` |
 | `cu_seqlens_ptr` | `const int*` | 累积 seqlen，形状 `[num_group + 1]` |
-| `tiles_ptr` | `int*` | **输出**：每个 group 的 tile 数，形状 `[num_group]` |
-| `cu_tiles_ptr` | `int*` | **输出**：累积 tile 数，形状 `[num_group + 1]` |
+| `tiles_ptr` | `int*` | **输出**：每个 group 的 **tile M** 数量，形状 `[num_group]` |
+| `cu_tiles_ptr` | `int*` | **输出**：累积 **tile M** 数量，形状 `[num_group + 1]` |
 | `num_group` / `m` / `n` / `k` | `int` | 问题维度 |
+
+**重要提示**：这里的 `tiles_ptr` 和 `cu_tiles_ptr` 只统计了 **tile M 的数量**，不涉及 tile N！tile N 的数量 `num_tile_n = (n + kTileN - 1) / kTileN` 在主 kernel 中直接计算
 
 (补充) BlockScan 的使用
 
@@ -291,7 +293,7 @@ BlockScan(temp_storage).ExclusiveSum(tiles, tiles, block_aggregate);
 1. **Host 端创建模板**：`td_xy` 包含了正确的 stride、tile size 等配置
 2. **Device 端只更新必要字段**：
    - **全局内存地址**：指向该 group 数据的起始位置
-   - **Shape**：根据该 group 的 seqlen 设置
+   - **Shape**：根据该 group 的 seqlen 设置，例如对于输入 X (activation)，其第 i 个 group 的 tma gmem tensor shape 应设置为 `[seqlens_ptr[igroup], k]`
 
 **为什么 stride 不需要更新？**
 
@@ -344,17 +346,34 @@ tma_descriptor_fence_acquire(td_xy + i);
 该 device function 是更新 tma descriptor 的核心。会从 gmem tensor 中提取 shape & stride & gmem ptr，然后把这些信息更新到 TMA descriptor 中。我一开始还有疑问：为什么一定要用 shared memory 创建 cuTensorMap？虽然我之前了解到 tma 存储的信息都是放在 smem 当中的，但是我们仍然可以把这些信息放到寄存器当中，然后修改，最后再存回 gmem 当中呀。后来 agent 了解到 `tma_descriptor_replace_shapes_in_shared_mem` 该 PTX 要求操作源必须在 shared memory 当中，所以必须使用 smem
 
 
-### 总结
+### 在 Group Gemm 中使用 TMA
 
-| 问题 | 答案 |
-|------|------|
-| 为什么需要 update_grouped_tma？ | 为每个 group 预配置 TMA descriptor，简化主 kernel 逻辑 |
-| Launch 多少个 block？ | `num_group + 1` 个 |
-| 每个 block 做什么？ | 前 num_group 个更新 TMA descriptor，最后一个计算 tile 统计 |
-| 为什么用 BlockScan？ | 高效计算 Exclusive Sum，得到累积 tile 索引 |
-| 为什么只更新 shape/addr？ | stride 对所有 group 都一样，不需要更新 |
-| tma_desc_commit_group 作用？ | 同一个 warp 中多个线程修改 TMA descriptor 时确保一致性 |
-| cp_fence_release 作用？ | Fused copy + release fence，与主 kernel 的 acquire 配对 |
+#### TMA for X (activation)
+
+在 hpc-ops 当中，其使用 tma 的方式是
+
+```cpp
+copy(tma_origin.with(new_tma_descriptor, mbarrier), gmem_tensor, smem_tensor);
+```
+
+此时，可以认为 copy 所使用的 tma descriptor 就不是 `tma_origin` 中原来在 Host 端定义的 tma descriptor 了，而是我们的 `new_tma_descriptor`。其 gmem ptr 和 shape 都发生了改变，以适应 group gemm 当中不同 group 的 activation 数据搬运
+
+#### TMA for W (weight)
+
+对于权重来说，其维度是三维的 `(n, k, num_group)`。相应的，我们在定义 tiled copy 时所使用的 **weight gmem tensor 也是三维的，不过需要注意的是：所使用的 copy box 却是二维的**
+
+```cpp
+using SLayoutW = decltype(tile_to_shape(SLayoutWAtom{}, 
+                          make_shape(Int<kTileN>{}, Int<kTileK>{}, Int<kStage>{})));
+// w is 3-dim tensor, but copy box is 2-dim
+auto tma_w = make_tma_copy(SM90_TMA_LOAD{}, w, take<0, 2>(SLayoutW{}));
+```
+
+我之前的理解是：tma 在搬运 tensor 的时候是根据首坐标 + box dim 来确定搬运数据的范围。此时首坐标是 3D 的，box dim 是 2D 的，这似乎挑战了我之前的理解。不过回答也非常简单，现在的数据范围是根据 3D 中的前 2D 坐标 + box dim 来确定的。合理猜测，如果我们把 gmem 维度顺序变成 (num_group, n, k)，但 slayout 保持不变，那么：
+  - slayout 第 0 维 (kTileN) → gmem 第 0 维 (num_group)                                                
+  - slayout 第 1 维 (kTileK) → gmem 第 1 维 (n)                                                        
+copy box 就会沿着 num_group 和 n 维度进行 copy，这显然不是我们想要的结果
+
 
 ## Transposed MMA
 
@@ -458,7 +477,159 @@ cute::copy(tma_d.with(td_y), tDs(_, iwarpgroup, Int<0>{}),
 
 ## Scheduler for Group Gemm
 
-TODO
+在之前学习 Hopper Gemm 的过程中，我们了解到 scheduler 的本质是把 iteration idx 映射到 `(m_idx, n_idx)` 的过程，由此决定该 tile 要计算的矩阵区域。而对于 Group Gemm 来说，我们还需要额外考虑一个 group 维度，i.e. 我们需要把 iteration idx 映射到 `(igroup, m_idx, n_idx)`
+
+hpc-ops 提供了两种调度模式：**Horizontal 模式**（小矩阵用线性扫描）和 **Vertical 模式**（大矩阵用二分查找）。有趣的是，hpc-ops 完全没有考虑 thread block swizzle 模式，单纯就是横向迭代和纵向迭代。这可能仍然由于 H20 本身带宽很强，对于数据的访问模式要求不高，所以 scheduler 就从简设计了
+
+### Horizontal 模式
+
+**适用条件**：`k <= 1024 || n <= 1024`（hidden_size 或 output_dim 较小）
+
+**核心思想**：将 block index `iblock` 扁平化为 `(itile_m_total, itile_n)`，然后从上次的位置开始线性扫描，找到 `itile_m_total` 落在哪个 group。
+
+让我们详细看 `get_next_tile_horizon` 函数的每个参数：
+
+```cpp
+__device__ __forceinline__ void get_next_tile_horizon(
+    const int *tiles_ptr,    // [in] 每个 group 的 tile 数
+    int iblock,              // [in] 当前 iteration_idx
+    int num_group,           // [in] group 总数
+    int &igroup,             // [in,out] 输入：上次找到的 group；输出：本次找到的 group
+    int &itile_m,            // [out] 在 group 内的 tile m 索引
+    int &itile_n,            // [out] tile n 索引
+    int &sum_tile_m,         // [in,out] 累积 tile 数（用于判断 group idx）
+    cutlass::FastDivmod flat_divider)  // [in] 预计算的 fast divider
+```
+**代码逻辑详解**：
+
+```cpp
+// 步骤 1: 将 iblock 分解为 (itile_m_total, itile_n)
+// flat_divider 做的是：
+//   itile_m_total = iblock / num_tile_n
+//   itile_n = iblock % num_tile_n
+flat_divider(itile_m_total, itile_n, iblock);
+
+// 步骤 2: 从上次的 igroup 位置开始线性扫描
+for (int i = igroup; i < num_group; i++) {
+  num_tile_m = tiles_ptr[i];      // 获取第 i 个 group 的 tile 数
+  sum_tile_m += num_tile_m;        // 累积
+  if (itile_m_total < sum_tile_m) {
+    // 找到！itile_m_total 落在第 i 个 group
+    igroup = i;
+    sum_tile_m = sum_tile_m - num_tile_m;  // 回退到 group 开始前
+    itile_m = itile_m_total - sum_tile_m;   // 计算在 group 内的索引
+    return;
+  }
+}
+igroup = -1;  // 没有更多 tile 了，结束
+```
+
+需要注意的是，所有的 `itile_m` i.e. `m_idx` 都是计算的 group 内的索引，而不是相对于第 0 个 group 的全局索引。这是合理的，因为我们本来就为每一个 group 分配了独立的 tma，我们要计算的就是其 group 内的偏移
+
+**为什么小矩阵用线性扫描？**
+- 小矩阵意味着 `num_group` 不大
+- 线性扫描实现简单，指令数少
+- **增量搜索**：从上次的 `igroup` 位置继续，实际复杂度接近 O(1)
+- 缓存友好：`tiles_ptr` 是连续访问的
+
+#### 补充：cutlass::FastDivmod
+
+首先，让我们**明确 FastDivmod 在 hpc-ops 中实际做了什么数学运算**。在 Horizontal 模式 scheduler 中，我们有一个线性索引 `iblock`，需要把它**分解成二维坐标** `(itile_m_total, itile_n)`。假设我们有一个固定的除数 `b = num_tile_n`（tile N 的总数），对于任意输入 `a = iblock`，FastDivmod 计算：
+
+```
+q = a / b    （商，整数除法，向下取整）
+r = a % b    （余数）
+```
+
+使得：
+```
+a = q * b + r,    其中 0 ≤ r < b
+```
+
+在 hpc-ops 中的具体命名：
+```
+itile_m_total = q = iblock / num_tile_n
+itile_n     = r = iblock % num_tile_n
+```
+
+BTW, 由于GPU 上整数除法指令很慢（~20 cycles），而 FastDiv 使用了乘法 + 移位来代替除法。这里我们就不做整理了。事实上我看 DeepGemm 仍然使用了整除运算，i.e. 直接使用除法 `/` 用于两个整型符号之间，即可获得 floor division
+
+### Vertical 模式
+
+**适用条件**：大矩阵（`k > 1024 && n > 1024`）
+
+**核心思想**：利用 `cu_tiles_ptr` 的累积索引结构，通过二分查找快速定位 `igroup`。
+
+```cpp
+__device__ __forceinline__ void get_next_tile_vert(
+    const int *cu_tiles_ptr,  // [in] 累积 tile 索引
+    int iblock,                // [in] 当前 block 索引，i.e. iteration_idx
+    int num_group,             // [in] group 总数
+    int &igroup,               // [out] 找到的 group
+    int &itile_m,              // [out] 在 group 内的 tile m 索引
+    int &itile_n,              // [out] tile n 索引
+    int total_m)               // [in] 总 tile m 数 = cu_tiles_ptr[num_group]
+```
+
+**代码逻辑详解**：
+
+```cpp
+// 步骤 1: 分解 iblock（注意这里和 Horizontal 模式不同！）
+int itile_m_total = iblock % total_m;
+itile_n = iblock / total_m;
+
+// 步骤 2: 二分查找找最大的 right 满足 cu_tiles_ptr[right] <= itile_m_total
+int left = 0;
+int right = num_group;
+while (left <= right) {
+  int mid = left + (right - left) / 2;
+  if (cu_tiles_ptr[mid] > itile_m_total) {
+    right = mid - 1;
+  } else {
+    left = mid + 1;
+  }
+}
+
+// 步骤 3: 计算在 group 内的 tile m 索引
+itile_m = itile_m_total - cu_tiles_ptr[right];
+igroup = right;
+```
+
+### Shared Memory 缓存优化
+
+在主 kernel 开始时，会把 `tiles_ptr` 或 `cu_tiles_ptr` 缓存到 shared memory 中：
+
+```cpp
+if constexpr (IsLoopH) {
+  // Horizontal 模式：缓存 tiles_ptr
+  for (int i = idx; i < num_group; i += blockDim.x) {
+    shm_tiles[i] = tiles_ptr[i];
+  }
+} else {
+  // Vertical 模式：缓存 cu_tiles_ptr
+  for (int i = idx; i < (num_group + 1); i += blockDim.x) {
+    shm_tiles[i] = cu_tiles_ptr[i];
+  }
+}
+```
+
+这样后续的 scheduler 调用可以访问 shared memory，减少 global memory 访问延迟。
+
+### 调度模式选择
+
+在 `group_gemm_pertensor_fp8.cu` 中：
+
+```cpp
+if (k <= 1024 || n <= 1024) {
+  // Horizontal 模式：小矩阵，线性扫描
+  group_gemm_pertensor_fp8_kernel<..., true>(...);
+} else {
+  // Vertical 模式：大矩阵，二分查找
+  group_gemm_pertensor_fp8_kernel<..., false>(...);
+}
+```
+
+我认为没有 threadblock swizzle 的 scheduler 很难做到 L2 cache 的优化，我对这里的划分原理也不是很清楚。只能大致理解为：对于 n 比较小的矩阵，我们沿水平方向(i.e. n 方向)进行遍历，可能有更好的 L2 cache 利用，因为此时处理的 tile 会在 m 方向上有所延展，此时能够有一些数据复用。反之，对于 n 比较大的矩阵，沿着水平方向遍历，大家都在同一横排上，数据复用效果差，所以沿着 m 方向遍历还更有机会一些
 
 ## Scale for DeQuantization
 

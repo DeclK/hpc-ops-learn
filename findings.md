@@ -602,10 +602,17 @@ __device__ __forceinline__ void get_next_tile_horizon(
 }
 ```
 
+**关键点解析**：
+- `flat_divider(itile_m_total, itile_n, iblock)`: 使用 fast divmod 将 `iblock` 分解为 `iblock = itile_m_total * num_tile_n + itile_n`
+- `igroup` 作为 in/out 参数，从上次的位置继续扫描，避免重复检查
+- `sum_tile_m` 累积 tile 数量，用于判断 `itile_m_total` 落在哪个 group
+- 返回时 `igroup` 是找到的 group，`itile_m` 是在该 group 内的 tile 索引
+
 **为什么小矩阵用线性扫描？**
 - 小矩阵意味着 num_group 不大
 - 线性扫描实现简单，指令数少
 - 缓存友好，因为 tiles_ptr 是连续访问的
+- 从上次的 `igroup` 位置继续搜索，实际复杂度远低于 O(n)
 
 ### 2. Vertical 模式（二分查找）
 
@@ -639,10 +646,17 @@ __device__ __forceinline__ void get_next_tile_vert(
 }
 ```
 
+**关键点解析**：
+- `iblock` 分解方式不同：`itile_m_total = iblock % total_m`，`itile_n = iblock / total_m`
+- 二分查找在 `cu_tiles_ptr` 数组中找最大的 `right` 满足 `cu_tiles_ptr[right] <= itile_m_total`
+- 因为 `cu_tiles_ptr` 是 exclusive sum，所以 `right` 就是对应的 `igroup`
+- `itile_m = itile_m_total - cu_tiles_ptr[right]` 得到在 group 内的 tile 索引
+
 **为什么大矩阵用二分查找？**
 - 大矩阵意味着 num_group 可能很大
 - 二分查找时间复杂度 O(log n)，远优于线性扫描 O(n)
 - cu_tiles_ptr 是有序的（累积和），天然适合二分查找
+- 不需要从上次位置继续，每次都是独立的 O(log n) 查找
 
 ### cu_tiles_ptr 的作用
 
@@ -665,26 +679,88 @@ BlockScan(temp_storage).ExclusiveSum(tiles, tiles, block_aggregate);
 
 ### 调度模式选择
 
-在主 kernel 调用处（`group_gemm_pertensor_fp8.cu`），根据问题规模选择模式：
+在主 kernel 调用处（`group_gemm_pertensor_fp8.cu` 第 69-89 行），根据问题规模选择模式：
 
 ```cpp
 if (k <= 1024 || n <= 1024) {
   // Horizontal 模式：小矩阵，线性扫描
-  group_gemm_pertensor_fp8_kernel<Config, TmaX, TmaW, TmaY, true>
-      <<<num_block, kThreadPerBlock, shm_size, stream>>>(...);
+  constexpr bool IsLoopH = true;
+  auto kernel =
+      kernels::group_gemm_pertensor_fp8_kernel<decltype(config), decltype(tma_x),
+                                               decltype(tma_w), decltype(tma_y), IsLoopH>;
+  cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
+
+  kernel<<<grid, block, shm_size, stream>>>(tma_w, tma_xy, (int *)seqlens_ptr, (float *)y_scale,
+                                            (int *)tiles_ptr, (int *)cu_tiles_ptr, num_group, m,
+                                            n, k, flat_divider);
 } else {
   // Vertical 模式：大矩阵，二分查找
-  group_gemm_pertensor_fp8_kernel<Config, TmaX, TmaW, TmaY, false>
-      <<<num_block, kThreadPerBlock, shm_size, stream>>>(...);
+  constexpr bool IsLoopH = false;
+  auto kernel =
+      kernels::group_gemm_pertensor_fp8_kernel<decltype(config), decltype(tma_x),
+                                               decltype(tma_w), decltype(tma_y), IsLoopH>;
+  cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
+
+  kernel<<<grid, block, shm_size, stream>>>(tma_w, tma_xy, (int *)seqlens_ptr, (float *)y_scale,
+                                            (int *)tiles_ptr, (int *)cu_tiles_ptr, num_group, m,
+                                            n, k, flat_divider);
 }
 ```
+
+**选择阈值**：`k <= 1024 || n <= 1024`
+- k = hidden_size，n = output_dim
+- 当这两个维度较小时，意味着问题规模小，group 数量可能也少
+- 当维度大时，问题规模大，group 数量可能很多
+
+### shared memory 中的 tiles 缓存
+
+在 kernel 开始时（`kernels.cuh` 第 228-236 行），将 tiles 或 cu_tiles 缓存到 shared memory：
+
+```cpp
+if constexpr (IsLoopH) {
+  for (int i = idx; i < num_group; i += blockDim.x) {
+    shm_tiles[i] = tiles_ptr[i];
+  }
+} else {
+  for (int i = idx; i < (num_group + 1); i += blockDim.x) {
+    shm_tiles[i] = cu_tiles_ptr[i];
+  }
+}
+```
+
+这样后续的 scheduler 调用可以访问 shared memory，减少 global memory 访问延迟。
+
+### 两种模式在 kernel 中的使用
+
+在 load warpgroup 和 math warpgroup 中都需要调用 scheduler：
+
+**Load warpgroup** (`kernels.cuh` 第 262-273 行)：
+```cpp
+if constexpr (IsLoopH) {
+  get_next_tile_horizon(shm_tiles, iblock, num_group, igroup, itile_m, itile_n, sum_tile_m,
+                        flat_divider);
+  if (igroup < 0) {
+    break;
+  }
+} else {
+  get_next_tile_vert(shm_tiles, iblock, num_group, igroup, itile_m, itile_n, total_m);
+  if (itile_n >= num_tile_n) {
+    break;
+  }
+}
+```
+
+**Math warpgroup** (`kernels.cuh` 第 329-340 行) 有完全相同的代码。
+
+注意：两个 warpgroup 独立地调度任务，通过 `iblock += gridDim.x` 来分配不同的 tile 给不同的 block。
 
 ### 总结
 
 Scheduler 的设计体现了**实用主义**：
-- 小矩阵：简单直接的线性扫描，开销小
-- 大矩阵：高效的二分查找，扩展性好
+- **小矩阵 (k<=1024 || n<=1024)**：Horizontal 模式，简单直接的线性扫描，利用缓存和增量搜索，实际开销很小
+- **大矩阵**：Vertical 模式，高效的二分查找，O(log n) 时间复杂度，扩展性好
 - 通过编译期条件（`if constexpr`）选择实现，无运行时开销
+- 两种模式都将 tiles/cu_tiles 缓存到 shared memory 优化访问
 
 ---
 
@@ -728,6 +804,649 @@ cute::copy(tma_d.with(td_y), tDs(_, iwarpgroup, Int<0>{}),
 #### 用户的参考链接
 1. [写给大家看的 CuTe 教程：TMA Copy](https://zhuanlan.zhihu.com/p/2003198909405763007)
 2. [cute 之 Hopper TMA](https://zhuanlan.zhihu.com/p/1985678344352731952)
+
+---
+
+## Vertical Scheduler 的数据局部性分析
+
+### 问题背景
+用户提出了一个非常好的问题：在 Vertical 模式中，我们对 iblock 进行 divide 的时候沿着 m 轴进行划分，这样很有可能两个不同的 iblock 划分到了不同的 igroup 当中。这会不会对数据的局部性产生较大的影响？
+
+### 两种模式的 iblock 分解方式对比
+
+让我们先回顾两种模式的 iblock 分解方式：
+
+**Horizontal 模式（先 N 后 M）：**
+```cpp
+// iblock = itile_m_total * num_tile_n + itile_n
+flat_divider(itile_m_total, itile_n, iblock);
+```
+
+**Vertical 模式（先 M 后 N）：**
+```cpp
+// iblock = itile_n * total_m + itile_m_total
+int itile_m_total = iblock % total_m;
+itile_n = iblock / total_m;
+```
+
+### 具体例子可视化
+
+假设：
+- `total_m = 10`（总 tile M 数）
+- `num_tile_n = 5`（tile N 总数）
+- `tiles_ptr = [4, 3, 3]`（3 个 group，每个 group 的 tile M 数）
+- `cu_tiles_ptr = [0, 4, 7, 10]`
+
+**Horizontal 模式**（iblock 增长方向：先遍历完 N，再 M+1）：
+```
+iblock:    0  1  2  3  4 |  5  6  7  8  9 | 10 11 12 13 14 | ...
+itile_m:   0  0  0  0  0 |  1  1  1  1  1 |  2  2  2  2  2 | ...
+itile_n:   0  1  2  3  4 |  0  1  2  3  4 |  0  1  2  3  4 | ...
+igroup:    0  0  0  0  0 |  0  0  0  0  0 |  0  0  0  0  0 | ... (连续 5 个 block 都在 igroup 0)
+```
+
+**Vertical 模式**（iblock 增长方向：先遍历完 M，再 N+1）：
+```
+iblock:    0  1  2  3 |  4  5  6 |  7  8  9 | 10 11 12 13 | 14 15 16 | 17 18 19 | ...
+itile_m:   0  1  2  3 |  4  5  6 |  7  8  9 |  0  1  2  3 |  4  5  6 |  7  8  9 | ...
+itile_n:   0  0  0  0 |  0  0  0 |  0  0  0 |  1  1  1  1 |  1  1  1 |  1  1  1 | ...
+igroup:    0  0  0  0 |  1  1  1 |  2  2  2 |  0  0  0  0 |  1  1  1 |  2  2  2 | ...
+           ↑              ↑        ↑        ↑              ↑        ↑
+         igroup 0      igroup 1  igroup 2  igroup 0      igroup 1  igroup 2
+         (连续 4 个)   (3 个)   (3 个)   (连续 4 个)   (3 个)   (3 个)
+```
+
+### 数据局部性影响分析
+
+**问题确认：是的，Vertical 模式确实存在频繁的 igroup 跳变！**
+
+在 Vertical 模式下，连续的 thread block 会：
+1. 先处理 igroup 0 的 4 个 tile M（iblock 0-3）
+2. 然后跳到 igroup 1 的 3 个 tile M（iblock 4-6）
+3. 然后跳到 igroup 2 的 3 个 tile M（iblock 7-9）
+4. 然后回到 igroup 0 的下一个 tile N（iblock 10-13）
+5. 如此反复...
+
+**这确实会影响数据局部性！** 具体影响：
+
+1. **TMA descriptor 切换**：每个 group 有独立的 TMA descriptor，频繁切换 igroup 意味着：
+   - 需要加载不同的 TMA descriptor
+   - TMA 引擎可能需要重新初始化
+   - 缓存的 descriptor 可能失效
+
+2. **权重 W 的访问模式**：
+   - 每个 group 有独立的 W[igroup, :, :]
+   - 频繁切换 igroup 会导致权重的访问不连续
+   - L2 缓存命中率可能下降
+
+3. **输入 X 的访问模式**：
+   - 每个 group 的 X 也是不连续的（中间隔着其他 group 的数据）
+   - 同样影响缓存命中率
+
+### 为什么 hpc-ops 还要这样设计？
+
+这是一个很好的工程权衡问题。让我们分析可能的原因：
+
+1. **Horizontal 模式在大矩阵下的问题**：
+   - Horizontal 模式在 `num_group` 很大时，线性扫描的开销可能很大
+   - 虽然有增量搜索优化，但最坏情况仍然是 O(n)
+   - 大矩阵通常意味着 `num_group` 也很大
+
+2. **二分查找的 O(log n) 优势**：
+   - Vertical 模式使用二分查找，稳定的 O(log n) 时间复杂度
+   - 在 `num_group` 很大时，这比线性扫描快得多
+
+3. **数据局部性问题的缓解**：
+   - **L2 缓存是共享的**：同一个 SM 内的多个 warp 可以共享 L2 缓存
+   - **TMA 的预取能力**：TMA 引擎可以自动预取数据，减轻缓存不命中的影响
+   - **工作集大小**：如果每个 group 的数据不大，可能仍然能缓存在 L2 中
+   - **每个 block 处理多个 tile**：在主循环中，`iblock += gridDim.x`，同一个 block 会处理：
+     - Vertical 模式下：同一个 block 会处理 `(itile_m_total, itile_n)`, `(itile_m_total, itile_n + k)`, `(itile_m_total, itile_n + 2k)`...
+     - 注意！同一个 block 处理的是**相同的 itile_m_total**，也就是**相同的 igroup**！
+
+### 关键点：同一个 Block 的访问模式
+
+让我们重新审视主 kernel 中的循环：
+
+```cpp
+for (int iblock = blockIdx.x; ; iblock += gridDim.x) {
+  // 获取 tile
+  // ...
+  
+  // 处理这个 tile
+  // ...
+}
+```
+
+**Vertical 模式下，同一个 block 处理的 tile 序列：**
+```
+iblock = blockIdx.x, blockIdx.x + gridDim.x, blockIdx.x + 2*gridDim.x, ...
+
+假设 gridDim.x = 128（128 个 block）
+blockIdx.x = 0:
+  itile_m_total = 0 % 10 = 0, itile_n = 0 / 10 = 0   ← igroup 0
+  itile_m_total = 128 % 10 = 8, itile_n = 128 / 10 = 12 ← igroup 2
+  itile_m_total = 256 % 10 = 6, itile_n = 256 / 10 = 25 ← igroup 1
+  ...
+
+等等，这看起来也不理想... 但等一下，gridDim.x 通常很大！
+```
+
+实际上，更重要的是：**每个 block 内部，一旦找到 igroup，就会一直处理这个 igroup 的 tile 吗？** 不，不是的，每次都是独立的。
+
+### 重新思考：也许问题没有那么严重
+
+让我们从另一个角度看：
+
+1. **每个 group 的数据是独立的**：Group GEMM 的本质就是处理多个独立的矩阵乘法
+2. **不同 group 的数据之间没有依赖**：所以访问顺序不影响正确性
+3. **缓存是按地址工作的**：即使跳变，如果数据总大小不超过缓存容量，仍然可以命中
+4. **现代 GPU 的 L2 缓存很大**：H20 有 50MB+ 的 L2 缓存，可以容纳很多 group 的数据
+
+### 总结
+
+| 问题 | 答案 |
+|------|------|
+| Vertical 模式是否会频繁跳变 igroup？ | **是的**，连续的 iblock 确实会在不同 igroup 之间跳变 |
+| 是否会影响数据局部性？ | **理论上是的**，但实际影响可能没有想象中大 |
+| 为什么还要这样设计？ | **工程权衡**：二分查找的 O(log n) 扩展性在大矩阵下更重要 |
+| 有什么缓解措施？ | L2 缓存、TMA 预取、同一个 block 处理的模式 |
+
+这是一个典型的**算法复杂度 vs 数据局部性**的权衡。在小矩阵（num_group 小）时，Horizontal 模式的线性扫描 + 好的数据局部性更优；在大矩阵（num_group 大）时，Vertical 模式的 O(log n) 二分查找更重要，即使牺牲一些数据局部性。
+
+---
+
+## TMA for W 的三维 Tensor + 二维 Copy Box 设计详解
+
+### 关键发现：W 的实际内存布局
+
+在 `group_gemm_pertensor_fp8.cu` 第 28-32 行，我们找到了 W 的完整定义：
+
+```cpp
+auto W = make_tensor(make_gmem_ptr(reinterpret_cast<const Tin *>(w_ptr)),
+                     make_shape(n, k, num_group), 
+                     make_stride(k, Int<1>{}, n * k));
+//                     ↑        ↑          ↑
+//                   stride0  stride1    stride2
+```
+
+**这是理解整个设计的关键！**
+
+---
+
+### 第一层：W 的 Shape 和 Stride 详解
+
+让我们详细分析 W 的 shape 和 stride：
+
+| 维度 | Shape | Stride | 说明 |
+|------|-------|--------|------|
+| **维度 0** | `n` (output_dim) | `k` | 每一行 n 间隔 k 个元素 |
+| **维度 1** | `k` (hidden_size) | `1` | k 维度是最内层，连续存储 |
+| **维度 2** | `num_group` | `n * k` | 每个 group 占用 n*k 个元素 |
+
+**内存布局图示：**
+
+```
+全局内存中的 W:
+┌─────────────────────────────────────────────────────────────┐
+│ group 0:                                                     │
+│   W[0, 0, 0], W[0, 1, 0], ..., W[0, k-1, 0]  ← n=0      │
+│   W[1, 0, 0], W[1, 1, 0], ..., W[1, k-1, 0]  ← n=1      │
+│   ...                                                       │
+│   W[n-1, 0, 0], W[n-1, 1, 0], ..., W[n-1, k-1, 0]       │
+├─────────────────────────────────────────────────────────────┤
+│ group 1:                                                     │
+│   W[0, 0, 1], W[0, 1, 1], ..., W[0, k-1, 1]  ← n=0      │
+│   W[1, 0, 1], W[1, 1, 1], ..., W[1, k-1, 1]  ← n=1      │
+│   ...                                                       │
+│   W[n-1, 0, 1], W[n-1, 1, 1], ..., W[n-1, k-1, 1]       │
+├─────────────────────────────────────────────────────────────┤
+│ group 2:                                                     │
+│   ...                                                       │
+└─────────────────────────────────────────────────────────────┘
+
+注意：
+- 同一个 group 内：形状是 (n, k)，k 连续
+- 不同 group 之间：间隔 n*k 个元素
+- 整个 W 的大小：n * k * num_group
+```
+
+**内存地址计算公式：**
+
+```
+W(in, ik, igroup) 的地址 = 
+  w_ptr + in * k          ← n 维度
+         + ik * 1          ← k 维度（连续）
+         + igroup * (n*k)  ← group 维度
+```
+
+---
+
+### 第二层：为什么全局 Tensor 是三维的？
+
+现在我们可以回答第一个问题：**为什么 W 的全局 tensor 是三维的 `(n, k, num_group)`？**
+
+**答案：因为所有 group 的权重在全局内存中是连续存储的！**
+
+这种设计有几个重要优势：
+
+1. **单个 TMA descriptor 可以描述所有 group**：不需要为每个 group 创建独立的 TMA descriptor
+2. **通过索引选择 group**：可以通过 `igroup` 索引直接访问不同 group 的数据
+3. **内存连续性**：同一个 group 的数据在内存中是连续的，便于 TMA 传输
+
+对比 X（激活）的设计：
+- **X**：每个 group 的数据在全局内存中不连续 → 需要为每个 group 独立的 TMA descriptor
+- **W**：所有 group 的数据在全局内存中连续 → 可以用一个三维 tensor + 索引来访问
+
+---
+
+### 第三层：为什么 Copy Box 是二维的？
+
+现在回答第二个问题：**为什么 TMA copy box 是二维的 `take<0, 2>(SLayoutW{})`？**
+
+让我们再看 config.h 中的代码：
+
+```cpp
+// SLayoutW 的形状是三维的：(kTileN, kTileK, kStage)
+using SLayoutW = decltype(tile_to_shape(SLayoutWAtom{}, 
+                          make_shape(Int<kTileN>{}, Int<kTileK>{}, Int<kStage>{})));
+
+// 但 TMA copy box 只取前两维！
+auto tma_w = make_tma_copy(SM90_TMA_LOAD{}, w, take<0, 2>(SLayoutW{}));
+//                                                        ↑
+//                                                     只取前两维！
+```
+
+**关键答案：TMA copy box 描述的是「每次拷贝什么形状」，而不是「全局 tensor 是什么形状」。**
+
+对于权重 W，每次 TMA 拷贝只需要：
+- **一个 tile** 的数据
+- 属于 **一个特定的 group**
+
+也就是说，每次 TMA 拷贝的是 `[kTileN, kTileK]` 的二维数据！
+
+```
+take<0, 2>(SLayoutW{})
+= 取 SLayoutW 的前两维
+= (kTileN, kTileK)
+= 正好是一个 tile 的形状！
+```
+
+**为什么不需要包含 kStage 维度？**
+- kStage 是 shared memory 中用于双缓冲的阶段数
+- TMA 每次只拷贝一个 stage 的数据到 shared memory
+- kStage 维度是 shared memory layout 的一部分，不是 TMA copy box 的一部分
+
+**为什么不需要包含 num_group 维度？**
+- num_group 是全局 tensor 的维度
+- 每次 TMA 拷贝只拷贝一个 group 的数据
+- 通过索引 `igroup` 来选择具体的 group，而不是通过 copy box
+
+---
+
+### 第四层：实际使用时的索引方式
+
+现在看 kernels.cuh 中的实际使用方式（第 191, 202, 287-288 行）：
+
+```cpp
+// 步骤 1: 创建全局的三维 TMA tensor
+auto gB = tma_b.get_tma_tensor(make_shape(n, k, num_group));
+//              ↑ shape: (n, k, num_group)
+
+// 步骤 2: 分区得到四维的 tile tensor
+auto tBg = btma_b.partition_S(gB);  
+//              ↑ shape: (TMA, TMA_N, TMA_K, num_group)
+
+// 步骤 3: 使用时通过索引选择具体的 tile 和 group
+cute::copy(tma_b.with(readable[ismem_write]), 
+           tBg(_, itile_n, itile_k, igroup),  // ← 四维索引！
+           tBs(_, 0, 0, ismem_write));
+//               ↑        ↑        ↑
+//            itile_n  itile_k  igroup
+```
+
+**关键点：`tBg(_, itile_n, itile_k, igroup)`**
+
+这里的索引是四维的：
+- `_` : TMA 维度（保持不变）
+- `itile_n` : 第几个 tile N
+- `itile_k` : 第几个 tile K
+- `igroup` : **第几个 group** ← 这就是我们选择 group 的方式！
+
+**不是通过 copy box 来选择 group，而是通过索引来选择 group！**
+
+---
+
+### 第五层：完整的数据流总结
+
+让我们用一个具体例子来说明整个流程：
+
+假设：
+- `n = 128` (output_dim)
+- `k = 128` (hidden_size)
+- `num_group = 4`
+- `kTileN = 128`, `kTileK = 128`
+
+**步骤 1: Host 端创建 W tensor**
+```cpp
+// group_gemm_pertensor_fp8.cu 第 28-32 行
+auto W = make_tensor(make_gmem_ptr(w_ptr),
+                     make_shape(128, 128, 4), 
+                     make_stride(128, Int<1>{}, 128*128));
+```
+
+**步骤 2: 创建 TMA copy（config.h 第 93 行）**
+```cpp
+auto tma_w = make_tma_copy(SM90_TMA_LOAD{}, w, take<0, 2>(SLayoutW{}));
+// copy box shape: (128, 128) ← 二维！
+```
+
+**步骤 3: Device 端使用（kernels.cuh）**
+```cpp
+// 创建全局三维 tensor
+auto gB = tma_b.get_tma_tensor(make_shape(128, 128, 4));
+
+// 分区得到四维 tile tensor
+auto tBg = btma_b.partition_S(gB);  // (TMA, TMA_N, TMA_K, 4)
+
+// 选择 group 0 的 tile (0, 0)
+tBg(_, 0, 0, 0)  ← 对应 W[0:128, 0:128, 0]
+
+// 选择 group 1 的 tile (0, 0)  
+tBg(_, 0, 0, 1)  ← 对应 W[0:128, 0:128, 1]
+```
+
+---
+
+### 第六层：TMA Descriptor 的样子（根据用户笔记推断）
+
+根据用户分享的 TMA 理解笔记，我们可以推断：
+
+**TMA descriptor 包含：**
+1. **全局内存地址**：指向 W 的起始位置 `w_ptr`
+2. **全局 tensor shape**：`(n, k, num_group)` ← 三维！
+3. **全局 tensor stride**：`(k, 1, n*k)` ← 三维！
+4. **Copy box shape**：`(kTileN, kTileK)` ← 二维！
+
+**关键点：**
+- TMA descriptor 可以描述**任意维度**的全局 tensor（最多 5 维，从 tma.cuh 第 11 行可以看出）
+- 但 **copy box 只需要描述每次拷贝的子区域形状**
+- 通过坐标系统来选择具体的子区域
+
+**三维坐标系统的工作原理：**
+
+根据用户笔记：
+```
+普通 tensor: layout function 输出标量（内存偏移）
+  Tensor(1, 2) = 1 * stride0 + 2 * stride1
+
+TMA tensor: layout function 输出向量（坐标）
+  Tensor(1, 2, 3) = (1, 2, 3) ← 三维坐标！
+```
+
+TMA 硬件根据：
+1. **起始坐标**：`(itile_n * kTileN, itile_k * kTileK, igroup)`
+2. **Box 维度**：`(kTileN, kTileK)` ← 注意！这里只需要两维！
+3. **全局 tensor 的 stride**：`(k, 1, n*k)`
+
+来确定要拷贝的内存区域。
+
+**为什么 box 维度只需要两维？**
+因为我们选择的是：
+- 第 `igroup` 个 group（固定一个 group）
+- 在该 group 内，拷贝 `(kTileN, kTileK)` 的二维 tile
+
+也就是说，**第三维（num_group）被固定为某个具体的 igroup，所以 copy box 只需要描述前两维！**
+
+---
+
+### 总结
+
+| 问题 | 答案 |
+|------|------|
+| W 的全局 tensor 为什么是三维的？ | 因为所有 group 的权重连续存储，形状为 `(n, k, num_group)`，stride 为 `(k, 1, n*k)` |
+| copy box 为什么是二维的？ | 因为每次 TMA 只拷贝一个 tile 的数据 `(kTileN, kTileK)`，igroup 通过索引选择，不是通过 copy box |
+| 如何选择不同的 group？ | 通过四维索引 `tBg(_, itile_n, itile_k, igroup)` 中的 `igroup` 来选择 |
+| TMA descriptor 是什么样子？ | 包含三维全局 tensor 的 shape/stride，以及二维 copy box 的 shape |
+| 为什么 W 可以共享 TMA descriptor？ | 因为所有 group 的权重在同一个连续内存区域中，可以通过三维坐标系统访问 |
+| 为什么 X 不行？ | 因为每个 group 的 X 数据在全局内存中不连续，需要独立的 TMA descriptor |
+
+**核心思想：**
+- **全局 tensor 形状** = 完整的数据布局（可以是多维）
+- **Copy box 形状** = 每次搬运的子区域形状（通常是二维）
+- **索引系统** = 选择具体子区域的坐标
+
+这个设计展示了 CuTe 和 TMA 的强大之处：**通过灵活的多维坐标系统，可以用一个 TMA descriptor 高效地访问三维 tensor 中的任意二维切片！**
+
+---
+
+## TMA Copy Box 维度选择机制详解
+
+### 用户的深刻问题
+
+用户提出了一个非常深刻的问题：
+
+> 我们拷贝的形状是二维，而坐标是三维的。现在我们要 copy 一个二维的形状，那么我们至少需要在三维之中选择两维来进行 copy 计算吧。那么为什么我们是选择了前两个维度，而不是一维度和三维度进行 copy 呢？这是由什么决定的呢？
+>
+> 一个例子:如果我们在构建 tma tiled copy 所使用的 gmem tensor 形状是 (num_Group, n, k) 而不是 (n, k, num_group)，我们在进行 copy(tma) 的时候，是不是这个 copy box 就会沿着 num_group & n 维度进行 copy 了？
+
+---
+
+### 第一层：答案不是"选择"，而是"映射"
+
+**关键发现：不是我们主动"选择"前两维，而是 slayout（shared memory layout）的形状决定了哪些 gmem 维度会被映射到 TMA copy box！**
+
+让我通过分析 `construct_tma_gbasis` 函数（copy_traits_sm90_tma.hpp 第 690 行）来解释这个机制。
+
+---
+
+### 第二层：construct_tma_gbasis 的核心流程
+
+整个机制的核心在 `construct_tma_gbasis` 函数中：
+
+```cpp
+// 第 721 行：获取 smem layout 的逆布局
+// smem idx -> smem coord
+auto inv_smem_layout = right_inverse(get_nonswizzle_portion(slayout));
+
+// 第 725 行：组合 cta_v_map 和 inv_smem_layout
+// 关键！这一步决定了哪些 gmem 维度被映射到 smem
+auto sidx2gmode_full = coalesce(composition(cta_v_map, inv_smem_layout));
+//                      ↑               ↑
+//              smem coord ->     smem idx ->
+//              gmem mode          smem coord
+//
+//              结果：smem idx -> gmem mode
+```
+
+**这里的关键是 `cta_v_map`！**
+
+`cta_v_map` 是从 `cta_tiler`（我们传给 `make_tma_copy` 的第三个参数）来的：
+
+```cpp
+// make_tma_copy 调用中
+auto cta_v_tile = make_identity_layout(shape(gtensor)).compose(cta_tiler);
+//                                                     ↑
+//                                              这就是我们传入的 slayout！
+```
+
+**也就是说：我们传入的 `slayout`（shared memory layout）的形状决定了哪些 gmem 维度会被映射到 TMA copy box！**
+
+---
+
+### 第三层：具体例子分析
+
+让我们用 hpc-ops 中的实际例子来说明：
+
+**情况 1：hpc-ops 的实际设计**
+
+```cpp
+// 1. Global memory tensor W
+shape: (n, k, num_group)  ← 三维
+stride: (k, 1, n*k)
+
+// 2. Shared memory layout SLayoutW (我们传入 make_tma_copy 的)
+shape: (kTileN, kTileK, kStage)  ← 注意！前两维是 (kTileN, kTileK)
+//                                   第三维 kStage 是双缓冲用的
+
+// 3. 因为 SLayoutW 的前两维是 (kTileN, kTileK)
+//    所以映射到 gmem 的前两维 (n, k)
+//    这就是为什么 copy box 沿着 n 和 k 维度！
+```
+
+**情况 2：如果 gmem tensor 形状是 (num_group, n, k)**
+
+```cpp
+// 假设我们这样定义：
+shape: (num_group, n, k)  ← 注意顺序变了！
+stride: (n*k, k, 1)
+
+// 如果 SLayoutW 仍然是 (kTileN, kTileK, kStage)
+// 那么映射关系就会变成：
+//   slayout 第 0 维 (kTileN) → gmem 第 0 维 (num_group)
+//   slayout 第 1 维 (kTileK) → gmem 第 1 维 (n)
+//
+// 这样 copy box 就会沿着 num_group 和 n 维度！
+// 这正是用户猜测的！
+```
+
+---
+
+### 第四层：关键代码细节
+
+让我们看 `construct_tma_gbasis` 中的关键步骤：
+
+**步骤 1：构建 smem idx -> gmem mode 的映射**
+
+```cpp
+// 第 721 行：smem idx -> smem coord
+auto inv_smem_layout = right_inverse(get_nonswizzle_portion(slayout));
+
+// 第 725 行：smem coord -> gmem mode
+auto sidx2gmode_full = coalesce(composition(cta_v_map, inv_smem_layout));
+```
+
+**步骤 2：提取有效维度**
+
+```cpp
+// 第 737-744 行：找出哪些 gmem 维度被映射到了
+auto smem_rank = find_if(stride(sidx2gmode_full), [](auto e) {
+  [[maybe_unused]] auto v = basis_value(e);
+  return not is_constant<1,decltype(v)>{};
+});
+
+auto sidx2gmode = take<0,smem_rank>(sidx2gmode_full);
+//              ↑
+//         只取被映射到的 gmem 维度！
+```
+
+**步骤 3：构建 TMA basis**
+
+```cpp
+// 第 760 行：coalesce_256 合并维度（最大 256）
+auto tma_gstride = coalesce_256(tile_gstride);
+```
+
+---
+
+### 第五层：coalesce_256 的作用
+
+`coalesce_256` 函数（第 681 行）很有意思，它会尝试合并维度，但单个维度最大不超过 256（TMA 硬件限制）：
+
+```cpp
+// 如果可以合并且不超过 256，就合并
+if (s0 * s1 <= 256) {
+  merge them;
+} else {
+  keep as separate dimensions;
+}
+```
+
+**但这不是维度选择的关键，关键还是 slayout 的形状！**
+
+---
+
+### 第六层：fill_tma_gmem_shape_stride 的作用
+
+最后看 `fill_tma_gmem_shape_stride` 函数（第 819 行）：
+
+```cpp
+// 第 834-861 行：遍历每个 TMA 模式
+for_each(make_seq<tma_rank>{}, [&](auto i) {
+  constexpr int tma_i_rank = decltype(rank<i>(tma_gbasis_stride))::value;
+  if constexpr (tma_i_rank == 1) {
+    // 简单情况：这个 TMA 模式对应单个 gmem 模式
+    auto ej = unwrap(get<i>(tma_gbasis_stride));
+    gmem_prob_shape[i]  = basis_get(ej, gmem_shape);
+    gmem_prob_stride[i] = basis_get(ej, gmem_stride);
+  } else {
+    // 复杂情况：这个 TMA 模式对应多个 gmem 模式
+    // 需要用 GCD 来计算 shape 和 stride
+    ...
+  }
+});
+```
+
+这里的 `tma_gbasis_stride` 就是之前 `construct_tma_gbasis` 的结果，它决定了 TMA 模式如何映射到 gmem 模式。
+
+---
+
+### 第七层：最终答案总结
+
+| 问题 | 答案 |
+|------|------|
+| 为什么选择前两维？ | **不是我们选择的，而是 slayout 的形状决定的！** slayout 的前两维 (kTileN, kTileK) 映射到 gmem 的前两维 (n, k) |
+| 由什么决定？ | 由传给 `make_tma_copy` 的 `slayout` 参数决定！slayout 的形状决定了哪些 gmem 维度被映射 |
+| 如果 gmem 形状是 (num_group, n, k) 会怎样？ | **是的！** 如果 gmem 维度顺序变了，但 slayout 还是 (kTileN, kTileK)，那么 copy box 就会沿着 num_group 和 n 维度 |
+| 如何验证？ | 改变 gmem tensor 的维度顺序，或者改变 slayout 的维度顺序，看看 TMA descriptor 如何变化 |
+
+---
+
+### 第八层：核心思想
+
+**整个机制的核心思想：**
+
+1. **Shared memory layout 是"主"**：slayout 的形状决定了我们要如何访问数据
+2. **Global memory tensor 是"从"**：gtensor 提供数据，但访问模式由 slayout 决定
+3. **Basis 映射是桥梁**：`construct_tma_gbasis` 构建了 slayout 维度到 gtensor 维度的映射
+4. **不是"选择"维度，而是"映射"维度**：slayout 的第 i 维映射到 gtensor 的哪个维度，取决于 basis 映射
+
+**换句话说：**
+- 不是我们说"我要 copy 前两维"
+- 而是我们说"我要 copy slayout 形状的数据"
+- CuTe 自动找出 slayout 维度和 gtensor 维度之间的映射关系
+
+---
+
+### 第九层：实际验证建议
+
+如果想验证这个理解，可以做以下实验：
+
+**实验 1：改变 gmem 维度顺序**
+```cpp
+// 原来的
+auto W = make_tensor(w_ptr, make_shape(n, k, num_group), make_stride(k, 1, n*k));
+
+// 改成
+auto W = make_tensor(w_ptr, make_shape(num_group, n, k), make_stride(n*k, k, 1));
+//                                                 ↑
+//                                          维度顺序变了！
+```
+看看 TMA copy 是否会沿着 num_group 和 n 维度。
+
+**实验 2：改变 slayout 维度顺序**
+```cpp
+// 原来的
+using SLayoutW = decltype(tile_to_shape(SLayoutWAtom{}, 
+                          make_shape(Int<kTileN>{}, Int<kTileK>{}, Int<kStage>{})));
+
+// 改成
+using SLayoutW = decltype(tile_to_shape(SLayoutWAtom{}, 
+                          make_shape(Int<kStage>{}, Int<kTileN>{}, Int<kTileK>{})));
+//                                                 ↑
+//                                          维度顺序变了！
+```
+看看 TMA copy 是否会沿着不同的 gmem 维度。
 
 ---
 *Update this file after every 2 view/browser/search operations*

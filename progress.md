@@ -102,18 +102,62 @@
   - `/cyq/Projects/hpc-ops/CUDA Programming 10.2.md` (用户更新)
 
 ### Phase 8: Scheduler for Group Gemm 详解
+- **Status:** complete
+- **Started:** 2026-04-01
+- **Completed:** 2026-04-01
+- **Actions taken:**
+  - 阅读 kernels.cuh 中的两个 scheduler 函数：get_next_tile_horizon 和 get_next_tile_vert
+  - 分析 Horizontal 模式的线性扫描实现，理解 flat_divider 和增量搜索的优化
+  - 分析 Vertical 模式的二分查找实现，理解 cu_tiles_ptr 的作用
+  - 阅读 group_gemm_pertensor_fp8.cu 中的调度模式选择逻辑
+  - 分析 shared memory 中 tiles/cu_tiles 的缓存优化
+  - 更新 findings.md，添加详细的 Scheduler 详解
+  - 更新 CUDA Programming 10.2.md，编写 "Scheduler for Group Gemm" 章节
+  - 详细解释两个函数的每个参数含义
+- Files created/modified:
+  - `/Projects/hpc-ops-learn/findings.md` (已详细更新 Scheduler 部分)
+  - `/Projects/hpc-ops-learn/task_plan.md` (Phase 8 标记为 complete)
+  - `/Projects/hpc-ops-learn/CUDA Programming 10.2.md` (已添加 Scheduler 章节)
+
+### Phase 9: Vertical Scheduler 数据局部性分析
+- **Status:** complete
+- **Started:** 2026-04-02
+- **Completed:** 2026-04-02
+- **Actions taken:**
+  - 分析用户提出的问题：Vertical 模式中沿着 m 轴划分 iblock 是否会影响数据局部性
+  - 对比两种模式的 iblock 分解方式
+  - 用具体例子可视化 iblock 分布
+  - 分析数据局部性的具体影响（TMA descriptor 切换、权重 W 访问、输入 X 访问）
+  - 解释为什么这是一个工程权衡（算法复杂度 vs 数据局部性）
+  - 总结现代 GPU 的缓解措施（L2 缓存、TMA 预取等）
+  - 更新 findings.md 和 CUDA Programming 10.2.md
+- Files created/modified:
+  - `/Projects/hpc-ops-learn/findings.md` (添加了详细的分析)
+  - `/Projects/hpc-ops-learn/CUDA Programming 10.2.md` (添加了 "关于 Vertical 模式数据局部性的深入分析" 章节)
+
+### Phase 10: Scale for DeQuantization 详解
 - **Status:** pending
 - **Actions taken:**
   -
 - Files created/modified:
   -
 
-### Phase 9: Scale for DeQuantization 详解
-- **Status:** pending
+### Phase 11: TMA for W 的三维 Tensor + 二维 Copy Box 设计详解
+- **Status:** complete
+- **Started:** 2026-04-02
+- **Completed:** 2026-04-02
 - **Actions taken:**
-  -
+  - 分析用户提出的问题：W 是三维 tensor 但 copy box 是二维的
+  - 重新阅读 config.h 和 kernels.cuh 中的相关代码
+  - 用户分享了他们之前对 TMA descriptor 的理解笔记
+  - 发现了 W 的完整定义：shape (n, k, num_group) + stride (k, 1, n*k)
+  - 详细分析了内存布局和索引机制
+  - 编写了完整的六层解释到 findings.md
+  - 更新了 CUDA Programming 10.2.md 文档
 - Files created/modified:
-  -
+  - `/Projects/hpc-ops-learn/findings.md` (添加了详细的 TMA for W 分析)
+  - `/Projects/hpc-ops-learn/CUDA Programming 10.2.md` (更新了 TMA for W 章节)
+  - `/Projects/hpc-ops-learn/task_plan.md` (Phase 11 标记为 complete)
 
 ## Session: 2026-03-26
 
@@ -145,11 +189,11 @@
 <!-- If you can answer these, context is solid -->
 | Question | Answer |
 |----------|--------|
-| Where am I? | Phase 3: Implementation & Documentation |
-| Where am I going? | Phase 4: Review & Refinement |
+| Where am I? | Phase 9: Scale for DeQuantization 详解 |
+| Where am I going? | 完成所有章节 |
 | What's the goal? | 完善 CUDA Programming 10.2.md 文档，添加关于 Group GEMM 的清晰解释 |
-| What have I learned? | Group GEMM 的概念、数据结构、优势（已修正理解） |
-| What have I done? | 已创建 Group GEMM 详解内容，正在根据用户反馈更新 |
+| What have I learned? | 两种 Scheduler 的实现细节：Horizontal 线性扫描（小矩阵）和 Vertical 二分查找（大矩阵） |
+| What have I done? | 已完成 "Scheduler for Group Gemm" 章节，详细解释了两个函数的参数含义 |
 
 ---
 *Update after completing each phase or encountering errors*

@@ -4,7 +4,7 @@
 完善 CUDA Programming 10.2.md 文档，添加关于 Group GEMM 的清晰解释，包括概念、数学表述、代码示例和实际应用场景。
 
 ## Current Phase
-Phase 8: Scheduler for Group Gemm 详解
+Phase 10: Scale for DeQuantization 详解
 
 ## Phases
 
@@ -61,18 +61,47 @@ Phase 8: Scheduler for Group Gemm 详解
 - **Status:** complete
 
 ### Phase 8: Scheduler for Group Gemm 详解
-- [ ] 分析 Horizontal 模式 (线性扫描)
-- [ ] 分析 Vertical 模式 (二分查找)
-- [ ] 理解两种模式的适用场景
-- [ ] 编写 "Scheduler for Group Gemm" 章节内容
-- **Status:** pending
+- [x] 分析 Horizontal 模式 (线性扫描)
+- [x] 分析 Vertical 模式 (二分查找)
+- [x] 理解两种模式的适用场景
+- [x] 编写 "Scheduler for Group Gemm" 章节内容
+- **Status:** complete
 
-### Phase 9: Scale for DeQuantization 详解
+### Phase 9: Vertical Scheduler 数据局部性分析
+- [x] 分析用户提出的问题：Vertical 模式中沿着 m 轴划分 iblock 是否会影响数据局部性
+- [x] 对比两种模式的 iblock 分解方式
+- [x] 用具体例子可视化 iblock 分布
+- [x] 分析数据局部性的具体影响（TMA descriptor 切换、权重 W 访问、输入 X 访问）
+- [x] 解释为什么这是一个工程权衡（算法复杂度 vs 数据局部性）
+- [x] 总结现代 GPU 的缓解措施（L2 缓存、TMA 预取等）
+- [x] 更新 findings.md 和 CUDA Programming 10.2.md
+- **Status:** complete
+
+### Phase 10: Scale for DeQuantization 详解
 - [ ] 理解 Pertensor 情况下的反量化缩放
 - [ ] 分析 Blockwise 情况下的 scale 查找复杂度
 - [ ] 理解需要的 layout algebra
 - [ ] 编写 "Scale for DeQuantization" 章节内容
 - **Status:** pending
+
+### Phase 11: TMA for W 的三维 Tensor + 二维 Copy Box 设计详解
+- [x] 理解为什么 W 的全局 tensor 是三维的 (n, k, num_group)
+- [x] 理解为什么 TMA copy box 是二维的 (take<0, 2>)
+- [x] 分析 CuTe 如何处理三维 tensor 的二维 copy
+- [x] 研究实际的数据访问机制和索引方式
+- [x] 查阅 CuTe 底层代码理解 TMA descriptor 的构造
+- [x] 编写详细解释到 CUDA Programming 10.2.md
+- **Status:** complete
+
+### Phase 12: TMA Copy Box 维度选择机制详解
+- [x] 分析 construct_tma_gbasis 函数的工作原理
+- [x] 理解 slayout 和 gtensor 之间的 basis 映射机制
+- [x] 分析 fill_tma_gmem_shape_stride 如何选择维度
+- [x] 回答：为什么选择前两维而不是其他组合？
+- [x] 回答：如果 gmem tensor 形状是 (num_group, n, k) 会怎样？
+- [x] 研究 coalesce_256 函数的作用
+- [x] 详细记录到 findings.md
+- **Status:** complete
 
 ## Key Questions
 1. Group GEMM 与普通 GEMM 的区别是什么？（已回答）
