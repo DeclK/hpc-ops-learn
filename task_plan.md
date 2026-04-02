@@ -82,7 +82,7 @@ Phase 10: Scale for DeQuantization 详解
 - [ ] 分析 Blockwise 情况下的 scale 查找复杂度
 - [ ] 理解需要的 layout algebra
 - [ ] 编写 "Scale for DeQuantization" 章节内容
-- **Status:** pending
+- **Status:** in_progress
 
 ### Phase 11: TMA for W 的三维 Tensor + 二维 Copy Box 设计详解
 - [x] 理解为什么 W 的全局 tensor 是三维的 (n, k, num_group)
