@@ -198,24 +198,35 @@
   - `/Projects/hpc-ops-learn/task_plan.md` (更新 Phase 10 状态)
 
 ### Phase 10: Scale for DeQuantization 详解
-- **Status:** in_progress
+- **Status:** complete
+- **Started:** 2026-04-08
+- **Completed:** 2026-04-08
 - **Actions taken:**
   - 检查文档中 "Scale for DeQuantization" 章节，目前为 TODO 状态
-  - 需要理解：Pertensor 反量化缩放、Blockwise scale 查找、layout algebra
-- **下一步：**
-  - 阅读 kernel 代码中反量化相关部分
-  - 理解 scale 的使用方式
-  - 编写详细的章节内容
+  - 阅读 kernels.cuh 中 pertensor 和 blockwise 两种模式的 scale 处理代码
+  - 理解 pertensor 模式的简单 scale 应用（第 347, 373-375 行）
+  - 理解 blockwise 模式的复杂 scale 加载和应用（第 596-599, 670-676, 694-700 行）
+  - 分析 config.h 中的 scale layout 定义（SLayoutXS, SLayoutWS, CopyBoxXS, CopyBoxWS）
+  - 理解 W scale 为什么 padding 到 4 倍数（itile_k / 4 加载，itile_k % 4 索引）
+  - 更新 findings.md，添加详细的 Scale for DeQuantization 详解
+  - 更新 task_plan.md，标记 Phase 10 的前三个任务为完成
+  - 基于 findings.md 的内容编写 "Scale for DeQuantization" 章节到 CUDA Programming 10.2.md
+  - 章节包含：Pertensor 反量化缩放、Blockwise Scale 查找、Scale Layout Algebra、两种方案对比、关键代码点速查表
+  - 更新 task_plan.md，标记 Phase 10 为 complete
+- **Files created/modified:**
+  - `/Projects/hpc-ops-learn/findings.md` (添加 Scale for DeQuantization 详解)
+  - `/Projects/hpc-ops-learn/task_plan.md` (Phase 10 标记为 complete)
+  - `/Projects/hpc-ops-learn/CUDA Programming 10.2.md` (添加 "Scale for DeQuantization" 完整章节)
 
 ## 5-Question Reboot Check
 <!-- If you can answer these, context is solid -->
 | Question | Answer |
 |----------|--------|
-| Where am I? | Phase 10: Scale for DeQuantization 详解 |
-| Where am I going? | 完成 "Scale for DeQuantization" 章节 |
+| Where am I? | Phase 10: Scale for DeQuantization 详解 (已完成) |
+| Where am I going? | 所有 Phase 都已完成！ |
 | What's the goal? | 完善 CUDA Programming 10.2.md 文档，添加关于 Group GEMM 的清晰解释 |
-| What have I learned? | TMA for W 的三维 tensor 设计、copy box 维度选择机制、Vertical scheduler 的数据局部性分析 |
-| What have I done? | 已完成 Phase 1-9, 11-12，正在进行 Phase 10 |
+| What have I learned? | Pertensor 和 Blockwise 两种量化方案的反量化缩放机制、scale layout algebra、W scale padding 到 4 倍数的工程优化 |
+| What have I done? | 已完成 Phase 1-12，"Scale for DeQuantization" 章节已添加到文档 |
 
 ---
 *Update after completing each phase or encountering errors*

@@ -1449,5 +1449,557 @@ using SLayoutW = decltype(tile_to_shape(SLayoutWAtom{},
 看看 TMA copy 是否会沿着不同的 gmem 维度。
 
 ---
+
+## Scale for DeQuantization 详解
+
+### 概述
+
+在 FP8 量化的 Group GEMM 中，反量化缩放（Scale for DeQuantization）是一个关键环节。hpc-ops 支持两种量化方案：
+
+1. **Pertensor 量化**：每个 group 使用单个缩放因子
+2. **Blockwise 量化**：每个 128 元素的块使用独立的缩放因子
+
+---
+
+### 1. Pertensor 情况下的反量化缩放
+
+#### 核心思想
+
+在 Pertensor 模式下，每个 group 有一个统一的缩放因子 `y_scale[igroup]`。
+
+#### 代码位置：`kernels.cuh` 第 347, 373-375 行
+
+**获取缩放因子：**
+```cpp
+// math warpgroup 中
+float scale = yscale_ptr[igroup];  // 第 347 行
+```
+
+**应用缩放因子：**
+```cpp
+// 第 373-375 行
+#pragma unroll
+for (int i = 0; i < size(tCr); ++i) {
+  tDr(i) = tCr(i) * scale + tDr(i);
+}
+```
+
+#### 数学原理
+
+**量化过程：**
+```
+X_quantized = round(X / x_scale)
+W_quantized = round(W / w_scale)
+y_scale = x_scale * w_scale
+```
+
+**反量化过程（在 GEMM 中）：**
+```
+Y = (X_quantized @ W_quantized^T) * y_scale
+  = (X_quantized @ W_quantized^T) * (x_scale * w_scale)
+  = (X / x_scale) @ (W / w_scale)^T * (x_scale * w_scale)
+  = X @ W^T  ✓  恢复原值！
+```
+
+#### Pertensor 的数据流
+
+```
+输入 (FP8): X_quantized, W_quantized
+     ↓
+  TMA 加载
+     ↓
+  GMMA 计算: C = A @ B (FP8 → FP32 累加)
+     ↓
+  应用缩放: C * y_scale (FP32)
+     ↓
+  类型转换: FP32 → BF16
+     ↓
+  TMA 存储到全局内存
+```
+
+---
+
+### 2. Blockwise 情况下的 Scale 查找与应用
+
+Blockwise 量化更复杂，因为每个 128 元素的块都有自己的缩放因子。
+
+#### 缩放因子的数据布局
+
+**X 的缩放因子 (xscale_ptr)：**
+```cpp
+// group_gemm_blockwise_fp8.cu 第 36-37 行
+auto XS = make_tensor(make_gmem_ptr(reinterpret_cast<const TS *>(xscale_ptr)),
+                      make_shape(num_block_k, m_pad), 
+                      make_stride(m_pad, Int<1>{}));
+```
+- 形状: `[num_block_k, m_pad]`
+- `num_block_k = k / 128`（K 维度每 128 个元素一个块）
+- `m_pad` 是 padding 后的 M 维度大小
+
+**W 的缩放因子 (wscale_ptr)：**
+```cpp
+// group_gemm_blockwise_fp8.cu 第 38-40 行
+auto WS = make_tensor(make_gmem_ptr(reinterpret_cast<const TS *>(wscale_ptr)),
+                      make_shape(num_block_n, num_block_k_pad4, num_group),
+                      make_stride(num_block_k_pad4, Int<1>{}, num_block_n * num_block_k_pad4));
+```
+- 形状: `[num_block_n, num_block_k_pad4, num_group]`
+- `num_block_n = n / 128`
+- `num_block_k_pad4` 是 padding 到 4 倍数的 `num_block_k`
+
+#### Shared Memory 中的 Scale 布局
+
+**config.h 第 135-138 行：**
+```cpp
+using SLayoutXS = decltype(make_layout(make_shape(Int<kStage>{}, Int<kTileS>{}),
+                                       make_stride(Int<kTileS>{}, Int<1>{})));
+using SLayoutWS = decltype(make_layout(make_shape(Int<kStage>{}, Int<kTileS>{}),
+                                       make_stride(Int<kTileS>{}, Int<1>{})));
+```
+- `kTileS = 64`（见 `group_gemm_blockwise_fp8.cu` 第 199 行）
+- 形状: `[kStage, kTileS]`
+
+#### TMA 加载 Scale
+
+**kernels.cuh 第 596-599 行（load warpgroup）：**
+```cpp
+cute::copy(tma_as.with(readable[ismem_write]),
+           tASg(_, itile_k, cu_tiles_ptr[igroup] + itile_m), 
+           tASs(_, ismem_write, 0));
+cute::copy(tma_bs.with(readable[ismem_write]), 
+           tBSg(_, itile_n, itile_k / 4, igroup),
+           tBSs(_, ismem_write, 0));
+```
+
+关键点：
+- **X scale**: `tASg(_, itile_k, cu_tiles_ptr[igroup] + itile_m)`
+  - `itile_k`: K 维度的 tile 索引
+  - `cu_tiles_ptr[igroup] + itile_m`: 该 group 内的 tile M 位置
+  
+- **W scale**: `tBSg(_, itile_n, itile_k / 4, igroup)`
+  - `itile_n`: N 维度的 tile 索引
+  - `itile_k / 4`: K 维度的 tile 索引除以 4（因为 padding 到 4 倍数）
+  - `igroup`: group 索引
+
+#### 在 Math Warpgroup 中应用 Scale
+
+**kernels.cuh 第 670-676 行：**
+```cpp
+float tCS[kN];
+
+float wscale = sBS(ismem_read, itile_k % 4);  // gBS(itile_n, itile_k, igroup);
+#pragma unroll
+for (int in = 0; in < kN; in++) {
+  tCS[in] = sAS(ismem_read, get<1>(tI_mn(0, in))) * wscale;
+}
+```
+
+**关键理解：**
+1. `wscale = sBS(ismem_read, itile_k % 4)`
+   - W scale 每 4 个 tile_k 共享一个（因为 `itile_k / 4` 加载）
+   - 用 `itile_k % 4` 索引
+
+2. `sAS(ismem_read, get<1>(tI_mn(0, in)))`
+   - X scale 对每个 M 位置都有独立的 scale
+   - `get<1>(tI_mn(0, in))` 获取该 fragment 在 M 维度的坐标
+
+3. `tCS[in] = x_scale * w_scale`
+   - 总缩放因子 = X 的缩放因子 × W 的缩放因子
+
+**应用到 GMMA 结果（第 694-700 行）：**
+```cpp
+#pragma unroll
+for (int in = 0; in < kN; in++) {
+  float yscale = tCS[in];
+#pragma unroll
+  for (int im = 0; im < kM; im++) {
+    tDr_mn(im, in) = tCr_mn(im, in) * yscale + tDr_mn(im, in);
+  }
+}
+```
+
+#### Blockwise 的数学原理
+
+**量化过程：**
+```
+对于 X 的每个块 (i, j)（128×128）：
+  X_block = X[i*128 : (i+1)*128, j*128 : (j+1)*128]
+  x_scale[i, j] = max(abs(X_block)) / 448.0
+  X_quantized_block = round(X_block / x_scale[i, j])
+
+对于 W 的每个块 (l, j)：
+  W_block = W[l*128 : (l+1)*128, j*128 : (j+1)*128]
+  w_scale[l, j] = max(abs(W_block)) / 448.0
+  W_quantized_block = round(W_block / w_scale[l, j])
+```
+
+**反量化过程（在 GEMM 中）：**
+```
+对于输出 Y 的块 (i, l)：
+  Y_tile = Σ_j (X_quantized_tile[i, j] @ W_quantized_tile[l, j]^T) 
+           * (x_scale[i, j] * w_scale[l, j])
+         = Σ_j (X_tile[i, j] / x_scale[i, j]) @ (W_tile[l, j] / w_scale[l, j])^T 
+           * (x_scale[i, j] * w_scale[l, j])
+         = Σ_j X_tile[i, j] @ W_tile[l, j]^T
+         = Y_tile[i, l]  ✓  恢复原值！
+```
+
+---
+
+### 3. Scale Layout Algebra（布局代数）
+
+让我们详细分析 scale 张量的布局设计。
+
+#### Pertensor Scale 的布局
+
+非常简单：
+```cpp
+// yscale_ptr: [num_group]
+float scale = yscale_ptr[igroup];
+```
+
+直接索引，不需要任何复杂的布局变换。
+
+#### Blockwise X Scale 的布局
+
+**全局内存布局（group_gemm_blockwise_fp8.cu 第 36-37 行）：**
+```cpp
+auto XS = make_tensor(make_gmem_ptr(reinterpret_cast<const TS *>(xscale_ptr)),
+                      make_shape(num_block_k, m_pad), 
+                      make_stride(m_pad, Int<1>{}));
+```
+
+- Shape: `(num_block_k, m_pad)`
+- Stride: `(m_pad, 1)`
+
+这意味着：
+```
+XS[itile_k, im] 的地址 = xscale_ptr + itile_k * m_pad + im * 1
+```
+
+**Shared Memory 布局（config.h 第 135-136 行）：**
+```cpp
+using SLayoutXS = decltype(make_layout(make_shape(Int<kStage>{}, Int<kTileS>{}),
+                                       make_stride(Int<kTileS>{}, Int<1>{})));
+```
+
+- Shape: `(kStage, kTileS)` where `kTileS = 64`
+- Stride: `(kTileS, 1)`
+
+**TMA Copy Box（config.h 第 141-142 行）：**
+```cpp
+using CopyBoxXS = decltype(make_layout(make_shape(Int<1>{}, Int<kTileM>{}),
+                                       make_stride(Int<kTileM>{}, Int<1>{})));
+```
+
+- Shape: `(1, kTileM)`
+- Stride: `(kTileM, 1)`
+
+**为什么这样设计？**
+
+注意 `kTileS = 64`，而 `kTileM` 可以是 16/32/48/64。这是因为：
+- 一个 tile M 可能小于 64，但 shared memory 按 64 对齐
+- TMA copy box 只拷贝实际需要的 `kTileM` 个元素
+
+#### Blockwise W Scale 的布局
+
+**全局内存布局（group_gemm_blockwise_fp8.cu 第 38-40 行）：**
+```cpp
+auto WS = make_tensor(make_gmem_ptr(reinterpret_cast<const TS *>(wscale_ptr)),
+                      make_shape(num_block_n, num_block_k_pad4, num_group),
+                      make_stride(num_block_k_pad4, Int<1>{}, num_block_n * num_block_k_pad4));
+```
+
+- Shape: `(num_block_n, num_block_k_pad4, num_group)`
+- Stride: `(num_block_k_pad4, 1, num_block_n * num_block_k_pad4)`
+
+这意味着：
+```
+WS[itile_n, itile_k_pad4, igroup] 的地址 = 
+  wscale_ptr + itile_n * num_block_k_pad4 
+             + itile_k_pad4 * 1 
+             + igroup * (num_block_n * num_block_k_pad4)
+```
+
+**为什么要 padding 到 4 倍数？**
+看 kernels.cuh 第 672 行和 599 行：
+```cpp
+float wscale = sBS(ismem_read, itile_k % 4);  // 加载时用 itile_k / 4
+```
+
+这是一个**工程优化**：
+- 将 `num_block_k` padding 到 4 的倍数
+- 这样每次可以加载 4 个连续的 scale 值
+- 在 shared memory 中用 `itile_k % 4` 索引
+
+**Shared Memory 布局（config.h 第 137-138 行）：**
+```cpp
+using SLayoutWS = decltype(make_layout(make_shape(Int<kStage>{}, Int<kTileS>{}),
+                                       make_stride(Int<kTileS>{}, Int<1>{})));
+```
+与 X scale 相同：`(kStage, kTileS)`，`kTileS = 64`
+
+**TMA Copy Box（config.h 第 143-144 行）：**
+```cpp
+using CopyBoxWS = decltype(make_layout(make_shape(Int<1>{}, Int<4>{}), 
+                                       make_stride(Int<4>{}, Int<1>{})));
+```
+
+- Shape: `(1, 4)` ← 只拷贝 4 个元素！
+- Stride: `(4, 1)`
+
+这证实了我们的理解：每次加载 4 个连续的 W scale 值。
+
+---
+
+### 4. 两种方案的对比总结
+
+| 特性 | Pertensor | Blockwise |
+|------|-----------|-----------|
+| **Scale 粒度** | 每个 group 一个 scale | 每个 128×128 块一个 scale |
+| **Scale 形状** | `[num_group]` | X: `[num_block_k, m_pad]`<br>W: `[num_block_n, num_block_k_pad4, num_group]` |
+| **精度** | 较低（单一 scale 可能无法表示所有值） | 较高（每个块独立 scale） |
+| **计算开销** | 低（单次乘法） | 较高（需要查找和累积多个 scale） |
+| **内存开销** | 小 | 大（需要存储更多 scale） |
+| **Scale 应用位置** | 所有 itile_k 完成后 | 每个 itile_k 都要应用 |
+| **Shared Memory 需求** | 无 | 需要存储 XS 和 WS |
+
+---
+
+### 5. 关键代码点速查表
+
+#### Pertensor（kernels.cuh）
+
+| 行号 | 代码 | 说明 |
+|------|------|------|
+| 347 | `float scale = yscale_ptr[igroup];` | 获取该 group 的 scale |
+| 373-375 | `tDr(i) = tCr(i) * scale + tDr(i);` | 应用 scale 到结果 |
+
+#### Blockwise（kernels.cuh）
+
+| 行号 | 代码 | 说明 |
+|------|------|------|
+| 596-597 | `copy(tma_as.with(...), tASg(_, itile_k, ...), ...);` | 加载 X scale |
+| 598-599 | `copy(tma_bs.with(...), tBSg(_, itile_n, itile_k/4, ...), ...);` | 加载 W scale（注意 `/4`） |
+| 672 | `float wscale = sBS(ismem_read, itile_k % 4);` | 获取 W scale（注意 `%4`） |
+| 674-676 | `tCS[in] = sAS(..., get<1>(tI_mn(0, in))) * wscale;` | 计算总 scale = x_scale * w_scale |
+| 694-700 | `tDr_mn(im, in) = tCr_mn(im, in) * yscale + ...;` | 应用 scale 到结果 |
+
+#### Blockwise（config.h）
+
+| 行号 | 代码 | 说明 |
+|------|------|------|
+| 135-136 | `SLayoutXS` 定义 | X scale 的 shared memory 布局 |
+| 137-138 | `SLayoutWS` 定义 | W scale 的 shared memory 布局 |
+| 141-142 | `CopyBoxXS` 定义 | X scale 的 TMA copy box |
+| 143-144 | `CopyBoxWS` 定义 | W scale 的 TMA copy box（形状是 `(1, 4)`！） |
+
+---
+
+## TMA Copy Box 中 Stride 的作用分析
+
+### 用户的问题
+
+用户在文档中提出了一个很好的问题：
+> 我不是很理解为什么要给 tma 的 copy box 加入 stride. 如果我们不加入 stride 会怎么样呢？
+
+### 第一层：先看代码中的例子
+
+让我们对比一下 config.h 中的两种写法：
+
+**写法 1：显式指定 stride（hpc-ops 的写法）**
+```cpp
+// CopyBoxXS (第 141-142 行)
+using CopyBoxXS = decltype(make_layout(make_shape(Int<1>{}, Int<kTileM>{}),
+                                       make_stride(Int<kTileM>{}, Int<1>{})));
+//                    ↑显式指定 stride
+
+// CopyBoxWS (第 143-144 行)
+using CopyBoxWS = decltype(make_layout(make_shape(Int<1>{}, Int<4>{}), 
+                                       make_stride(Int<4>{}, Int<1>{})));
+//                    ↑显式指定 stride
+```
+
+**写法 2：不指定 stride（假设的写法）**
+```cpp
+using CopyBoxXS = decltype(make_layout(make_shape(Int<1>{}, Int<kTileM>{})));
+//                                                    ↑只给 shape，不给 stride
+```
+
+### 第二层：CuTe 中 `make_layout` 的行为
+
+在 CuTe 中，`make_layout` 有多个重载：
+
+**重载 1：只接受 shape**
+```cpp
+make_layout(make_shape(a, b, c, ...))
+```
+- 自动创建 **row-major** 布局（最后一维连续）
+- stride 自动计算：`stride = (b*c, c, 1)`
+
+**重载 2：接受 shape 和 stride**
+```cpp
+make_layout(make_shape(a, b, c, ...), make_stride(s0, s1, s2, ...))
+```
+- 使用用户指定的 stride
+- 可以创建任意布局（不一定是 row-major）
+
+### 第三层：对于 Copy Box，两种写法结果可能相同！
+
+让我们用 CopyBoxWS 作为例子分析：
+
+**Shape:** `(1, 4)`
+- 第 0 维: 1
+- 第 1 维: 4
+
+**显式指定的 stride:** `(4, 1)`
+- 第 0 维 stride: 4
+- 第 1 维 stride: 1
+
+**如果不指定 stride，自动生成的 stride 也是 `(4, 1)`！**
+因为 row-major 布局就是最后一维连续。
+
+**结论：对于简单的 row-major 布局，两种写法结果相同！**
+
+### 第四层：那为什么 hpc-ops 还要显式指定 stride？
+
+既然结果相同，为什么 hpc-ops 还要多此一举？这是一个**工程实践**问题，有几个重要原因：
+
+#### 原因 1：代码可读性和自文档化
+
+**显式指定 stride：**
+```cpp
+make_layout(make_shape(1, 4), make_stride(4, 1))
+//           ↑ shape        ↑ stride
+// 一眼就能看出：
+//   - 形状是 (1, 4)
+//   - 第 1 维是连续的（stride=1）
+//   - 第 0 维的 stride 是 4
+```
+
+**不指定 stride：**
+```cpp
+make_layout(make_shape(1, 4))
+// 需要读者自己推断：
+//   - 这是 row-major 吗？
+//   - stride 是多少？
+//   - 哪一维连续？
+```
+
+#### 原因 2：防止意外的布局变化
+
+假设未来有人修改代码，改变了维度顺序：
+
+**修改前（正常）：**
+```cpp
+make_layout(make_shape(1, 4))  // stride = (4, 1)，第 1 维连续
+```
+
+**修改后（维度顺序变了）：**
+```cpp
+make_layout(make_shape(4, 1))  // stride = (1, 4)，第 1 维还是连续，但形状变了！
+```
+
+**但如果显式指定 stride：**
+```cpp
+// 修改前
+make_layout(make_shape(1, 4), make_stride(4, 1))
+
+// 修改后（编译器会报错或行为不符合预期）
+make_layout(make_shape(4, 1), make_stride(4, 1))
+// shape=(4,1) 但 stride=(4,1) → 这可能不是你想要的！
+```
+
+显式指定 stride 可以让这种错误更容易被发现。
+
+#### 原因 3：与非 row-major 布局保持一致
+
+在某些复杂情况下，布局可能不是 row-major。例如：
+
+**Swizzle 布局（用于 bank conflict 优化）：**
+```cpp
+// 这可能不是简单的 row-major
+using SLayoutXAtom = decltype(slayout_selector<kSwizzleX, Tin>());
+```
+
+在这种情况下，必须显式指定 stride。为了代码风格统一，简单的布局也显式指定 stride。
+
+#### 原因 4：TMA 的特殊要求
+
+TMA 硬件对布局有特定要求：
+
+1. **某些维度必须是连续的**（stride=1）
+2. **某些维度必须满足对齐要求**
+
+显式指定 stride 可以确保：
+- 你清楚地知道哪一维是连续的
+- 编译器不会意外生成不符合 TMA 要求的布局
+
+### 第五层：如果不显式指定 stride 会怎么样？
+
+**答案：对于 CopyBoxXS 和 CopyBoxWS，可能什么都不会发生！**
+
+因为：
+1. 它们的形状很简单 `(1, kTileM)` 和 `(1, 4)`
+2. Row-major 布局正好是我们想要的
+3. 自动生成的 stride 和显式指定的 stride 完全相同
+
+**但在更复杂的情况下，可能会出问题：**
+
+| 场景 | 不显式指定 stride 的风险 |
+|------|------------------------|
+| 形状不是简单的 row-major | 可能生成错误的布局 |
+| 需要特定维度连续 | 编译器可能选了错误的维度 |
+| TMA 有对齐要求 | 可能违反硬件限制 |
+| 代码需要长期维护 | 可读性差，容易出错 |
+
+### 第六层：看其他代码的佐证
+
+让我们看看 hpc-ops 中其他地方的写法：
+
+**SLayoutXS 和 SLayoutWS（shared memory 布局）：**
+```cpp
+// 第 135-138 行
+using SLayoutXS = decltype(make_layout(make_shape(Int<kStage>{}, Int<kTileS>{}),
+                                       make_stride(Int<kTileS>{}, Int<1>{})));
+using SLayoutWS = decltype(make_layout(make_shape(Int<kStage>{}, Int<kTileS>{}),
+                                       make_stride(Int<kTileS>{}, Int<1>{})));
+//                    ↑也是显式指定 stride！
+```
+
+**CopyBoxY（输出的 copy box）：**
+```cpp
+// 第 139-140 行
+using CopyBoxY = decltype(tile_to_shape(SLayoutYAtom{},
+                                          make_shape(Int<kTileN / kWarpgroupM>{}, Int<kTileM>{})));
+//                    ↑这个没有显式指定 stride！
+```
+
+注意 `CopyBoxY` 使用的是 `tile_to_shape`，它会保留 `SLayoutYAtom` 的 stride 信息。
+
+### 第七层：总结
+
+| 问题 | 答案 |
+|------|------|
+| **为什么要给 TMA copy box 加入 stride？** | **工程实践原因：** 1. 代码可读性；2. 防止意外错误；3. 与复杂布局保持一致；4. 明确表达意图 |
+| **如果不加入 stride 会怎么样？** | **对于 CopyBoxXS/CopyBoxWS：** 可能什么都不会发生，自动生成的 stride 正好正确。**对于更复杂的布局：** 可能会出问题 |
+| **显式指定 stride 是必须的吗？** | **不是必须的**，但是强烈推荐的工程实践 |
+| **CuTe 会自动推断 stride 吗？** | **是的**，对于 `make_layout(shape)`，会自动生成 row-major 布局 |
+
+### 核心思想
+
+**这不是一个技术问题，而是一个软件工程问题！**
+
+- **技术上**：两种写法可能产生相同的结果
+- **工程上**：显式指定 stride 有很多好处
+  - 代码更清晰
+  - 意图更明确
+  - 维护更容易
+  - 错误更少
+
+这就像写代码时加注释：技术上注释不是必须的，但好的注释能让代码更容易理解和维护！
+
+---
+
 *Update this file after every 2 view/browser/search operations*
 *This prevents visual information from being lost*
