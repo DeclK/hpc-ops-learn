@@ -643,7 +643,8 @@ if (k <= 1024 || n <= 1024) {
 在 FP8 量化计算中，输入数据和权重都是 FP8 格式，计算过程中使用 FP32 累积以保持精度，最后需要乘以 scale 进行反量化。hpc-ops 提供了两种模式：Pertensor（全张量共享一个 scale）和 Blockwise（每个数据块有独立的 scale）。Pertensor 模式甚至都不需要使用 tma，直接从 kernel 的参数传进来就行，这里就不多介绍。我们还是重点学习 blockwise 的 scale 是如何参与计算的。我们需要明确的点：
 
 1. blockwise gemm 的 quantize & dequantize 数学公式
-2. 在 kernel 当中，每一个线程如何获得正确的 scale 数据以完成 blockwise gemm 计算
+2. cta 对问题的划分。我们一个 stage 当中，分配多少的 smem 去存储 scale
+3. 每一个线程如何获得正确的 scale 数据以完成 blockwise gemm 计算
    1. 对 layout C 的 partition 解析，提出 V,M,N style 的重要视角 (V: local view, M: repeat at M dim, N: repeat at N dim)
    2. retile mn 的作用：把视角转换为完整的 mn 视角，而不是 vmn 视角
       ((frg_V, frg_M, frg_N), M, N) -> ((frg_V, frg_N, N), (frg_M, M)) 变成一个 (M, N) 视角的 tensor
@@ -666,7 +667,7 @@ if (k <= 1024 || n <= 1024) {
       2. 这个 C layout 在 M 维度上有 M 个这样的 local value
       3. 这个 C layout 在 N 维度上有 N 个这样的 local value
       这三个维度就能够拼凑出每一个 thread 所获得的 value 的全部位置。这就是 partition 的本质 zipped divide + compose：用一个 layout mn 去划分一个 tensor mn (zipped_divide)，并通过 layout tv -> mn 最终获得每一个 thread 获得的 value (compose)。这种 VMN-style 不仅仅出现在 value 维度，我们也会在 thread 维度看到。例如 mma 当中
-3. 代码走读与其中的一些小优化技巧
+4. 代码完整走读与其中的一些小优化技巧
    对代码流程以及问题划分、资源分配有一个完整的理解
    1. hpc-ops 当中把 MN 是反过来的，所以在获得数据的时候也需要 transpose
    2. smem 是根据 stage 进行规划的。流水线的资源以 stage 进行规划，这样可以以同一个 mbarrier 进行同步
@@ -678,29 +679,64 @@ if (k <= 1024 || n <= 1024) {
 我们首先介绍 blockwise quantization 具体是怎么计算的，然后再整理其 scale layout 形式
 
 ```python
-X: [M, K]
-W: [K, N]
-Y: [M, N]
-block_size = 128
+# 维度定义
+M: int                  # 输入序列长度
+K: int                  # 隐藏层维度
+N: int                  # 输出维度
+block_size: int = 128   # 量化块大小
 
-TODO: 使用伪代码完成 blockwise gemm quantization
+# 输入与权重
+X: Tensor = [M, K]      # 输入激活
+W: Tensor = [K, N]      # 权重
+Y: Tensor = [M, N]      # 输出结果
+
+# X 量化：每 K/block_size 块一个 scale
+X_q, X_s = quantize_X(X)
+# X_q.shape = [M, K]
+# X_s.shape = [M, K // block_size]
+
+# W 量化：每 (K/block_size, N/block_size) 块一个 scale  
+W_q, W_s = quantize_W(W)
+# W_q.shape = [K, N]
+# W_s.shape = [K // block_size, N // block_size]
+
+def blockwise_gemm(X_q, X_s, W_q, W_s, Y):
+    # 维度重排，方便分块计算
+    X_q -> [M, K // block_size, block_size]
+        -> [K // block_size, M, 1, block_size]
+
+    W -> [K // block_size, block_size, N // block_size, block_size]
+      -> [K // block_size, N // block_size, block_size, block_size]
+
+    Y -> [M, N]
+      -> [M, N // block_size, block_size]
+
+    # 分块矩阵乘法
+    for i, j, k in iteration(M, N // block_size, K // block_size):
+        Y[i, j] += X_q @ W_q * X_s[k, i] * W_s[k, j]  # 反量化缩放
+
+    # 结果 reshape
+    Y -> [M, N]
+    return Y
 ```
+实际上我们的 TensorCore M 方向上并不是一个一个计算的，而是以 kTileM 为单位进行 mma 计算。这里只是为了方便逻辑表示，对每一个 M 进行了 iteration
 
-**X 的缩放因子 (xscale_ptr)：**
-- Layout: `(num_block_k, m_pad) : (m_pad, 1)`
-- `num_block_k = k / 128`（K 维度每 128 个元素一个块）
-- `m_pad` 是 padding 后的 M 维度大小
+以上是一个朴素的 blockwise gemm，在 hpc-ops 当中，我们使用的是 group gemm，所以对于 X 和 W 都要做相应的 group 划分。我们从其 scale 的定义来一窥其中的改变
 
-为什么需要对 m 进行 pad？原因仍然是在于 group gemm 有多个 group，我们需要针对每一个 group pad 到 CTATile 对齐的情况（128 in this case），pad scale 应该不是一个耗时的操作
+**X scale** 的 Layout 为：
+```cpp
+(num_block_k, m_pad) : (m_pad, 1)
+```
+`num_block_k = k / 128`（K 维度每 128 个元素一个块），`m_pad` 是 padding 后的 M 维度大小。**为什么需要对 m 进行 pad？**原因仍然是在于 group gemm 有多个 group，我们需要针对每一个 group pad 到 CTATile 对齐的情况（128 in this case），pad scale 应该不是一个耗时的操作
 
-**W 的缩放因子 (wscale_ptr)：**
-- Layout: `(num_block_n, num_block_k_pad4, num_group) : (num_block_k_pad4, 1, num_block_n * num_block_k_pad4)`
-- `num_block_n = n / 128`
-- `num_block_k_pad4` 是 padding 到 4 倍数的 `num_block_k`
+**W scale** 的 layout 为：
+```cpp
+(num_block_n, num_block_k_pad4, num_group) : (num_block_k_pad4, 1, num_block_n * num_block_k_pad4)
+```
+`num_block_n = n / 128`， `num_block_k_pad4` 是 padding 到 4 倍数的 `num_block_k`。**为什么要对 k 进行 pad？**可能原因在于 hpc-ops 定义的 weight scale copy box 的大小是 `(1, 4)`，所以最好进行 4 对齐处理。不过 tma 应该能够处理 out of bound 的情况，不太清楚这个 pad 是否是必须的
 
-为什么要对 k 进行 pad？可能原因在于 hpc-ops 定义的 weight scale copy box 的大小是 `(1, 4)`，所以最好进行 4 对齐处理。不过 tma 应该能够处理 out of bound 的情况，不太清楚这个 pad 是否是必须的
+#### CTA 问题划分
 
-#### Shared Memory 中的 Scale 布局
 
 **config.h 第 135-138 行：**
 ```cpp
@@ -789,3 +825,15 @@ for (int itile_k = 0; itile_k < ntile_k; ++itile_k) {
 1. hpc-ops 并没有使用 multicast 功能。由于该原因，hpc-ops 在 H100 上的性能就不如 DeepGemm。这在 [issue](https://github.com/Tencent/hpc-ops/issues/28) 当中有提到：For the H100, which has higher compute throughput but lower memory bandwidth, the pipeline places more emphasis on memory access patterns. 这说明在 roofline model 当中，H100 需要更大的 GEMM 计算来达到 compute bound，否则很容易就变得 memory bound。在 Thor 上更是如此，估计其 fp16 算力为 250TFLOPS，而其带宽只有 275GB/s，此使需要计算强度超过 930+ Flops/Byte 才能达到 compute bound。对于端侧来说，几乎大部分的 gemm 都达不到这个计算强度，i.e. 都是 memory bound kernel。而对于 H20 来说，其算力低，带宽大，计算强度拐点 37 Flops/Byte = (148 TFlops / 4000 GB/s) 几乎所有的算子都是 compute bound，所以打不打开 multicast 对性能没那么大影响
 2. tma copy 时 smem layout 和 gmem layout (在 swizlle 之前) layout 应当保持一致 (都为 MN-major or K-major)，否则将不符合要求。这是由 copy atom 的连续性要求决定的。另外一个补充结论：swizzle 只处理二维的情况，因为 shared memory 就是二维的，在决定好一个最小的读取模式后（要求填满一整行 bank，否则不会产生 bank conflict）使用 tile_to_shape 进行 product，tile_to_shape 默认 col major product
 3. 我们在让 AI 进行整理的过程中，一定要给 AI 列好提纲，按照自己的思路来，否则 agent 自行生成的整理，看似尽然有序，实则无法触及原理核心，并且冗长的 AI 叙述会增加我们的负担
+4. DeepGemm 当中的 1d1d & 1d2d 分别代表什么？
+   1d1d 和 1d2d 代表的是 scaling factor (缩放因子) 的粒度 (granularity) 布局
+
+    - 1d1d，A & B 的 scaling factor 都是 1d
+    - 1d2d，A 的 scaling factor 是 1d，B 的 scaling factor 是 2d，应该是对应了 blockwise scaling
+
+    | 类型     | Recipe          | SFA 粒度          | SFB 粒度            | 说明                                |
+    | -------- | --------------- | ----------------- | ------------------- | ----------------------------------- |
+    | **1d1d** | `(1, 1, 128)`   | per-token (1x128) | per-token (1x128)   | 两个矩阵都用细粒度 scaling          |
+    | **1d2d** | `(1, 128, 128)` | per-token (1x128) | per-block (128x128) | 矩阵 B 用粗粒度 (128列共享) scaling |
+
+    最初的 DeepGemm 实现的是 1d2d，我们在本文中讨论的也是 1d2d 的情况。而 1d1d 更多是为 Blackwell 架构实现的，因为其在硬件上直接原生支持了 blockwise scaling gemm，即：我们不需要再在 CUDA core 上进行 dequantize 的计算，tensor core 直接帮我们算完了

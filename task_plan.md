@@ -4,7 +4,7 @@
 完善 CUDA Programming 10.2.md 文档，添加关于 Group GEMM 的清晰解释，包括概念、数学表述、代码示例和实际应用场景。
 
 ## Current Phase
-Phase 10: Scale for DeQuantization 详解
+Phase 10: Scale for DeQuantization 详解 (Polishing)
 
 ## Phases
 
@@ -82,7 +82,8 @@ Phase 10: Scale for DeQuantization 详解
 - [x] 分析 Blockwise 情况下的 scale 查找复杂度
 - [x] 理解需要的 layout algebra
 - [x] 编写 "Scale for DeQuantization" 章节内容
-- **Status:** complete
+- [ ] Polish 文档内容，补充 blockwise quantization 伪代码
+- **Status:** in_progress
 
 ### Phase 11: TMA for W 的三维 Tensor + 二维 Copy Box 设计详解
 - [x] 理解为什么 W 的全局 tensor 是三维的 (n, k, num_group)
