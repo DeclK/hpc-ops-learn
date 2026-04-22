@@ -640,100 +640,61 @@ if (k <= 1024 || n <= 1024) {
 
 ## Scale for DeQuantization
 
-在 FP8 量化的 Group GEMM 中，反量化缩放（Scale for DeQuantization）是一个关键环节。hpc-ops 支持两种量化方案：
+在 FP8 量化计算中，输入数据和权重都是 FP8 格式，计算过程中使用 FP32 累积以保持精度，最后需要乘以 scale 进行反量化。hpc-ops 提供了两种模式：Pertensor（全张量共享一个 scale）和 Blockwise（每个数据块有独立的 scale）。Pertensor 模式甚至都不需要使用 tma，直接从 kernel 的参数传进来就行，这里就不多介绍。我们还是重点学习 blockwise 的 scale 是如何参与计算的。我们需要明确的点：
 
-1. **Pertensor 量化**：每个 group 使用单个缩放因子
-2. **Blockwise 量化**：每个 128 元素的块使用独立的缩放因子
+1. blockwise gemm 的 quantize & dequantize 数学公式
+2. 在 kernel 当中，每一个线程如何获得正确的 scale 数据以完成 blockwise gemm 计算
+   1. 对 layout C 的 partition 解析，提出 V,M,N style 的重要视角 (V: local view, M: repeat at M dim, N: repeat at N dim)
+   2. retile mn 的作用：把视角转换为完整的 mn 视角，而不是 vmn 视角
+      ((frg_V, frg_M, frg_N), M, N) -> ((frg_V, frg_N, N), (frg_M, M)) 变成一个 (M, N) 视角的 tensor
+      展示 mma trait 当中的 c layout
+      ```cpp
+      using CLayout_64xN   = Layout<Shape <Shape <  _4,_8, _4>,Shape < _2,_2,Int<N/8>>>,
+                              Stride<Stride<_128,_1,_16>,Stride<_64,_8,   _512>>>;
 
----
+      using CLayout_64x8   = CLayout_64xN<  8>;
+      using CLayout_64x16  = CLayout_64xN< 16>;
+      using CLayout_64x32  = CLayout_64xN< 32>;
+      using CLayout_64x64  = CLayout_64xN< 64>;
+      using CLayout_64x96  = CLayout_64xN< 96>;
+      using CLayout_64x128 = CLayout_64xN<128>;
+      using CLayout_64x192 = CLayout_64xN<192>;
+      using CLayout_64x256 = CLayout_64xN<256>;
+      ```
+      C layout 就是 tv->mn 的映射。我们关注一个 thread 的 value layout : (2,2,N/8):(64,8,512)。其代表了 value 按照 (frg_V, frg_M, frg_N) 的方式在排布，并且 frg_V 是沿着 N 的方向连续的。当我们使用 C layout partition 一个 tensor 时，会获得一个新的 tensor ((frg_V, frg_M, frg_N), M, N)，这个 tensor 就代表了：
+      1. 单个 C layout 的 local value i.e. 单个 thread 所得到的 value 为 (frg_V, frg_M, frg_N)
+      2. 这个 C layout 在 M 维度上有 M 个这样的 local value
+      3. 这个 C layout 在 N 维度上有 N 个这样的 local value
+      这三个维度就能够拼凑出每一个 thread 所获得的 value 的全部位置。这就是 partition 的本质 zipped divide + compose：用一个 layout mn 去划分一个 tensor mn (zipped_divide)，并通过 layout tv -> mn 最终获得每一个 thread 获得的 value (compose)。这种 VMN-style 不仅仅出现在 value 维度，我们也会在 thread 维度看到。例如 mma 当中
+3. 代码走读与其中的一些小优化技巧
+   对代码流程以及问题划分、资源分配有一个完整的理解
+   1. hpc-ops 当中把 MN 是反过来的，所以在获得数据的时候也需要 transpose
+   2. smem 是根据 stage 进行规划的。流水线的资源以 stage 进行规划，这样可以以同一个 mbarrier 进行同步
+   3. 把 scale 全部放到了 register
 
-### Pertensor 情况下的反量化缩放
 
-#### 核心思想
+### Blockwise Quantization & Scale Layout
 
-在 Pertensor 模式下，每个 group 有一个统一的缩放因子 `y_scale[igroup]`。
+我们首先介绍 blockwise quantization 具体是怎么计算的，然后再整理其 scale layout 形式
 
-#### 代码位置：`kernels.cuh` 第 347, 373-375 行
+```python
+X: [M, K]
+W: [K, N]
+Y: [M, N]
+block_size = 128
 
-**获取缩放因子：**
-```cpp
-// math warpgroup 中
-float scale = yscale_ptr[igroup];  // 第 347 行
+TODO: 使用伪代码完成 blockwise gemm quantization
 ```
-
-**应用缩放因子：**
-```cpp
-// 第 373-375 行
-#pragma unroll
-for (int i = 0; i < size(tCr); ++i) {
-  tDr(i) = tCr(i) * scale + tDr(i);
-}
-```
-
-#### 数学原理
-
-**量化过程：**
-```
-X_quantized = round(X / x_scale)
-W_quantized = round(W / w_scale)
-y_scale = x_scale * w_scale
-```
-
-**反量化过程（在 GEMM 中）：**
-```
-Y = (X_quantized @ W_quantized^T) * y_scale
-  = (X_quantized @ W_quantized^T) * (x_scale * w_scale)
-  = (X / x_scale) @ (W / w_scale)^T * (x_scale * w_scale)
-  = X @ W^T  ✓  恢复原值！
-```
-
-#### Pertensor 的数据流
-
-```
-输入 (FP8): X_quantized, W_quantized
-     ↓
-  TMA 加载
-     ↓
-  GMMA 计算: C = A @ B (FP8 → FP32 累加)
-     ↓
-  应用缩放: C * y_scale (FP32)
-     ↓
-  类型转换: FP32 → BF16
-     ↓
-  TMA 存储到全局内存
-```
-
----
-
-### Blockwise 情况下的 Scale 查找与应用
-
-Blockwise 量化更复杂，每一个 token 都为每个 128 元素的块都有自己的缩放因子。
-
-TODO: 定义 blockwise 量化 & 反量化
-
-#### 缩放因子的数据布局
 
 **X 的缩放因子 (xscale_ptr)：**
-```cpp
-// group_gemm_blockwise_fp8.cu 第 36-37 行
-auto XS = make_tensor(make_gmem_ptr(reinterpret_cast<const TS *>(xscale_ptr)),
-                      make_shape(num_block_k, m_pad), 
-                      make_stride(m_pad, Int<1>{}));
-```
-- 形状: `[num_block_k, m_pad]`
+- Layout: `(num_block_k, m_pad) : (m_pad, 1)`
 - `num_block_k = k / 128`（K 维度每 128 个元素一个块）
 - `m_pad` 是 padding 后的 M 维度大小
 
 为什么需要对 m 进行 pad？原因仍然是在于 group gemm 有多个 group，我们需要针对每一个 group pad 到 CTATile 对齐的情况（128 in this case），pad scale 应该不是一个耗时的操作
 
 **W 的缩放因子 (wscale_ptr)：**
-```cpp
-// group_gemm_blockwise_fp8.cu 第 38-40 行
-auto WS = make_tensor(make_gmem_ptr(reinterpret_cast<const TS *>(wscale_ptr)),
-                      make_shape(num_block_n, num_block_k_pad4, num_group),
-                      make_stride(num_block_k_pad4, Int<1>{}, num_block_n * num_block_k_pad4));
-```
-- 形状: `[num_block_n, num_block_k_pad4, num_group]`
+- Layout: `(num_block_n, num_block_k_pad4, num_group) : (num_block_k_pad4, 1, num_block_n * num_block_k_pad4)`
 - `num_block_n = n / 128`
 - `num_block_k_pad4` 是 padding 到 4 倍数的 `num_block_k`
 
@@ -769,242 +730,62 @@ using SLayoutWS = decltype(make_layout(make_shape(Int<kStage>{}, Int<kTileS>{}),
     TODO: 假设一种情况，copy 一个 2d box，我们的 gmem 是 col-major 的，而 smem 是 row-major 的，这样 tma copy 也能够完成吗？
 为什么要给 Copy box 设置 stride，不是直接使用 tile size 就可以吗？另外我发现 `SLayoutXS` 的 shape 为 `[kStage, kTileS]`，而 copy box 的大小是 `[1, kTileM]`，这是合理的吗？可以看到在 hpc-ops 当中限制了 kTileM 最大就是 64，所以这里的是合理的，保障了一定有足够的空间 copy 当前的 A scale
 
-#### TMA 加载 Scale
+### 代码解析
 
-**kernels.cuh 第 596-599 行（load warpgroup）：**
+在 `kernels.cuh` 第 670-700 行：
+
 ```cpp
-cute::copy(tma_as.with(readable[ismem_write]),
-           tASg(_, itile_k, cu_tiles_ptr[igroup] + itile_m), 
-           tASs(_, ismem_write, 0));
-cute::copy(tma_bs.with(readable[ismem_write]), 
-           tBSg(_, itile_n, itile_k / 4, igroup),
-           tBSs(_, ismem_write, 0));
-```
+// Shared memory 中的 scale 张量布局
+// SLayoutXS: (kStage, kTileS) with stride (kTileS, 1)
+// SLayoutWS: (kStage, kTileS) with stride (kTileS, 1)
+auto sAS = make_tensor(make_smem_ptr(shm_as), SLayoutAS{});
+auto sBS = make_tensor(make_smem_ptr(shm_bs), SLayoutBS{});
 
-关键点：
-- **X scale**: `tASg(_, itile_k, cu_tiles_ptr[igroup] + itile_m)`
-  - `itile_k`: K 维度的 tile 索引
-  - `cu_tiles_ptr[igroup] + itile_m`: 该 group 内的 tile M 位置
-  
-- **W scale**: `tBSg(_, itile_n, itile_k / 4, igroup)`
-  - `itile_n`: N 维度的 tile 索引
-  - `itile_k / 4`: K 维度的 tile 索引除以 4（因为 padding 到 4 倍数）
-  - `igroup`: group 索引
+// K 维度累加循环
+for (int itile_k = 0; itile_k < ntile_k; ++itile_k) {
+  // 等待数据加载完成
+  wait_barrier(readable[ismem_read], phase);
 
-#### 在 Math Warpgroup 中应用 Scale
+  // 步骤 1: 从 shared memory 读取 wscale
+  // 注意: itile_k % 4 是因为 wscale 的 K 维度 padding 到 4 的倍数
+  float wscale = sBS(ismem_read, itile_k % 4);
 
-**kernels.cuh 第 670-676 行：**
-```cpp
-float tCS[kN];
-
-float wscale = sBS(ismem_read, itile_k % 4);  // gBS(itile_n, itile_k, igroup);
+  // 步骤 2: 计算 xscale * wscale 得到中间 scale tCS
+  // 这是一个逐元素的乘法，为每个 N 维度准备独立的 scale
+  float tCS[kN];
 #pragma unroll
-for (int in = 0; in < kN; in++) {
-  tCS[in] = sAS(ismem_read, get<1>(tI_mn(0, in))) * wscale;
-}
-```
+  for (int in = 0; in < kN; in++) {
+    tCS[in] = sAS(ismem_read, get<1>(tI_mn(0, in))) * wscale;
+  }
 
-**关键理解：**
-1. `wscale = sBS(ismem_read, itile_k % 4)`
-   - W scale 每 4 个 tile_k 共享一个（因为 `itile_k / 4` 加载）
-   - 用 `itile_k % 4` 索引
+  // 步骤 3: GMMA 计算（不包含 scale）
+  tiled_mma.accumulate_ = GMMA::ScaleOut::Zero;
+  for (int ik = 0; ik < size<2>(tAr); ++ik) {
+    cute::gemm(tiled_mma, tBr, tAr, tCr);
+  }
 
-2. `sAS(ismem_read, get<1>(tI_mn(0, in)))`
-   - X scale 对每个 M 位置都有独立的 scale
-   - `get<1>(tI_mn(0, in))` 获取该 fragment 在 M 维度的坐标
-
-3. `tCS[in] = x_scale * w_scale`
-   - 总缩放因子 = X 的缩放因子 × W 的缩放因子
-
-**应用到 GMMA 结果（第 694-700 行）：**
-```cpp
+  // 步骤 4: 使用 tCS 进行反量化
+  auto tDr_mn = retile_fragment(tDr);
 #pragma unroll
-for (int in = 0; in < kN; in++) {
-  float yscale = tCS[in];
+  for (int in = 0; in < kN; in++) {
+    float yscale = tCS[in];  // 每个 N 维度有独立的 scale
 #pragma unroll
-  for (int im = 0; im < kM; im++) {
-    tDr_mn(im, in) = tCr_mn(im, in) * yscale + tDr_mn(im, in);
+    for (int im = 0; im < kM; im++) {
+      tDr_mn(im, in) = tCr_mn(im, in) * yscale + tDr_mn(im, in);
+    }
   }
 }
 ```
 
-#### Blockwise 的数学原理
+### 其他
+**reformat_x_scale kernel**
 
-**量化过程：**
-```
-对于 X 的每个块 (i, j)（128×128）：
-  X_block = X[i*128 : (i+1)*128, j*128 : (j+1)*128]
-  x_scale[i, j] = max(abs(X_block)) / 448.0
-  X_quantized_block = round(X_block / x_scale[i, j])
+原始的 xscale 布局是 `[m, n]`（与激活数据相同），但 blockwise kernel 需要的格式是 `[num_block_k, m_pad]`。这两个布局之间存在转置和对齐关系，所以需要 `reformat_x_scale_kernel` 进行转换。
 
-对于 W 的每个块 (l, j)：
-  W_block = W[l*128 : (l+1)*128, j*128 : (j+1)*128]
-  w_scale[l, j] = max(abs(W_block)) / 448.0
-  W_quantized_block = round(W_block / w_scale[l, j])
-```
-
-**反量化过程（在 GEMM 中）：**
-```
-对于输出 Y 的块 (i, l)：
-  Y_tile = Σ_j (X_quantized_tile[i, j] @ W_quantized_tile[l, j]^T) 
-           * (x_scale[i, j] * w_scale[l, j])
-         = Σ_j (X_tile[i, j] / x_scale[i, j]) @ (W_tile[l, j] / w_scale[l, j])^T 
-           * (x_scale[i, j] * w_scale[l, j])
-         = Σ_j X_tile[i, j] @ W_tile[l, j]^T
-         = Y_tile[i, l]  ✓  恢复原值！
-```
-
----
-
-### Scale Layout Algebra（布局代数）
-
-让我们详细分析 scale 张量的布局设计。
-
-#### Pertensor Scale 的布局
-
-非常简单：
-```cpp
-// yscale_ptr: [num_group]
-float scale = yscale_ptr[igroup];
-```
-
-直接索引，不需要任何复杂的布局变换。
-
-#### Blockwise X Scale 的布局
-
-**全局内存布局（group_gemm_blockwise_fp8.cu 第 36-37 行）：**
-```cpp
-auto XS = make_tensor(make_gmem_ptr(reinterpret_cast<const TS *>(xscale_ptr)),
-                      make_shape(num_block_k, m_pad), 
-                      make_stride(m_pad, Int<1>{}));
-```
-
-- Shape: `(num_block_k, m_pad)`
-- Stride: `(m_pad, 1)`
-
-这意味着：
-```
-XS[itile_k, im] 的地址 = xscale_ptr + itile_k * m_pad + im * 1
-```
-
-**Shared Memory 布局（config.h 第 135-136 行）：**
-```cpp
-using SLayoutXS = decltype(make_layout(make_shape(Int<kStage>{}, Int<kTileS>{}),
-                                       make_stride(Int<kTileS>{}, Int<1>{})));
-```
-
-- Shape: `(kStage, kTileS)` where `kTileS = 64`
-- Stride: `(kTileS, 1)`
-
-**TMA Copy Box（config.h 第 141-142 行）：**
-```cpp
-using CopyBoxXS = decltype(make_layout(make_shape(Int<1>{}, Int<kTileM>{}),
-                                       make_stride(Int<kTileM>{}, Int<1>{})));
-```
-
-- Shape: `(1, kTileM)`
-- Stride: `(kTileM, 1)`
-
-**为什么这样设计？**
-
-注意 `kTileS = 64`，而 `kTileM` 可以是 16/32/48/64。这是因为：
-- 一个 tile M 可能小于 64，但 shared memory 按 64 对齐
-- TMA copy box 只拷贝实际需要的 `kTileM` 个元素
-
-#### Blockwise W Scale 的布局
-
-**全局内存布局（group_gemm_blockwise_fp8.cu 第 38-40 行）：**
-```cpp
-auto WS = make_tensor(make_gmem_ptr(reinterpret_cast<const TS *>(wscale_ptr)),
-                      make_shape(num_block_n, num_block_k_pad4, num_group),
-                      make_stride(num_block_k_pad4, Int<1>{}, num_block_n * num_block_k_pad4));
-```
-
-- Shape: `(num_block_n, num_block_k_pad4, num_group)`
-- Stride: `(num_block_k_pad4, 1, num_block_n * num_block_k_pad4)`
-
-这意味着：
-```
-WS[itile_n, itile_k_pad4, igroup] 的地址 = 
-  wscale_ptr + itile_n * num_block_k_pad4 
-             + itile_k_pad4 * 1 
-             + igroup * (num_block_n * num_block_k_pad4)
-```
-
-**为什么要 padding 到 4 倍数？**
-看 kernels.cuh 第 672 行和 599 行：
-```cpp
-float wscale = sBS(ismem_read, itile_k % 4);  // 加载时用 itile_k / 4
-```
-
-这是一个**工程优化**：
-- 将 `num_block_k` padding 到 4 的倍数
-- 这样每次可以加载 4 个连续的 scale 值
-- 在 shared memory 中用 `itile_k % 4` 索引
-
-**Shared Memory 布局（config.h 第 137-138 行）：**
-```cpp
-using SLayoutWS = decltype(make_layout(make_shape(Int<kStage>{}, Int<kTileS>{}),
-                                       make_stride(Int<kTileS>{}, Int<1>{})));
-```
-与 X scale 相同：`(kStage, kTileS)`，`kTileS = 64`
-
-**TMA Copy Box（config.h 第 143-144 行）：**
-```cpp
-using CopyBoxWS = decltype(make_layout(make_shape(Int<1>{}, Int<4>{}), 
-                                       make_stride(Int<4>{}, Int<1>{})));
-```
-
-- Shape: `(1, 4)` ← 只拷贝 4 个元素！
-- Stride: `(4, 1)`
-
-这证实了我们的理解：每次加载 4 个连续的 W scale 值。
-
----
-
-### 两种方案的对比总结
-
-| 特性 | Pertensor | Blockwise |
-|------|-----------|-----------|
-| **Scale 粒度** | 每个 group 一个 scale | 每个 128×128 块一个 scale |
-| **Scale 形状** | `[num_group]` | X: `[num_block_k, m_pad]`<br>W: `[num_block_n, num_block_k_pad4, num_group]` |
-| **精度** | 较低（单一 scale 可能无法表示所有值） | 较高（每个块独立 scale） |
-| **计算开销** | 低（单次乘法） | 较高（需要查找和累积多个 scale） |
-| **内存开销** | 小 | 大（需要存储更多 scale） |
-| **Scale 应用位置** | 所有 itile_k 完成后 | 每个 itile_k 都要应用 |
-| **Shared Memory 需求** | 无 | 需要存储 XS 和 WS |
-
----
-
-### 关键代码点速查表
-
-#### Pertensor（kernels.cuh）
-
-| 行号 | 代码 | 说明 |
-|------|------|------|
-| 347 | `float scale = yscale_ptr[igroup];` | 获取该 group 的 scale |
-| 373-375 | `tDr(i) = tCr(i) * scale + tDr(i);` | 应用 scale 到结果 |
-
-#### Blockwise（kernels.cuh）
-
-| 行号 | 代码 | 说明 |
-|------|------|------|
-| 596-597 | `copy(tma_as.with(...), tASg(_, itile_k, ...), ...);` | 加载 X scale |
-| 598-599 | `copy(tma_bs.with(...), tBSg(_, itile_n, itile_k/4, ...), ...);` | 加载 W scale（注意 `/4`） |
-| 672 | `float wscale = sBS(ismem_read, itile_k % 4);` | 获取 W scale（注意 `%4`） |
-| 674-676 | `tCS[in] = sAS(..., get<1>(tI_mn(0, in))) * wscale;` | 计算总 scale = x_scale * w_scale |
-| 694-700 | `tDr_mn(im, in) = tCr_mn(im, in) * yscale + ...;` | 应用 scale 到结果 |
-
-#### Blockwise（config.h）
-
-| 行号 | 代码 | 说明 |
-|------|------|------|
-| 135-136 | `SLayoutXS` 定义 | X scale 的 shared memory 布局 |
-| 137-138 | `SLayoutWS` 定义 | W scale 的 shared memory 布局 |
-| 141-142 | `CopyBoxXS` 定义 | X scale 的 TMA copy box |
-| 143-144 | `CopyBoxWS` 定义 | W scale 的 TMA copy box（形状是 `(1, 4)`！） |
+**转置的原因**：为了优化访问模式。重新格式化后的 xscale 在 kernel 中可以更高效地通过 TMA 加载。
 
 ## Questions
 
 1. hpc-ops 并没有使用 multicast 功能。由于该原因，hpc-ops 在 H100 上的性能就不如 DeepGemm。这在 [issue](https://github.com/Tencent/hpc-ops/issues/28) 当中有提到：For the H100, which has higher compute throughput but lower memory bandwidth, the pipeline places more emphasis on memory access patterns. 这说明在 roofline model 当中，H100 需要更大的 GEMM 计算来达到 compute bound，否则很容易就变得 memory bound。在 Thor 上更是如此，估计其 fp16 算力为 250TFLOPS，而其带宽只有 275GB/s，此使需要计算强度超过 930+ Flops/Byte 才能达到 compute bound。对于端侧来说，几乎大部分的 gemm 都达不到这个计算强度，i.e. 都是 memory bound kernel。而对于 H20 来说，其算力低，带宽大，计算强度拐点 37 Flops/Byte = (148 TFlops / 4000 GB/s) 几乎所有的算子都是 compute bound，所以打不打开 multicast 对性能没那么大影响
-  
+2. tma copy 时 smem layout 和 gmem layout (在 swizlle 之前) layout 应当保持一致 (都为 MN-major or K-major)，否则将不符合要求。这是由 copy atom 的连续性要求决定的。另外一个补充结论：swizzle 只处理二维的情况，因为 shared memory 就是二维的，在决定好一个最小的读取模式后（要求填满一整行 bank，否则不会产生 bank conflict）使用 tile_to_shape 进行 product，tile_to_shape 默认 col major product
+3. 我们在让 AI 进行整理的过程中，一定要给 AI 列好提纲，按照自己的思路来，否则 agent 自行生成的整理，看似尽然有序，实则无法触及原理核心，并且冗长的 AI 叙述会增加我们的负担
